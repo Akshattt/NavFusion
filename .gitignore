@@ -35,3 +35,4 @@ Outputs/
 outputs/
 Environment/
 environment/
+*.pt

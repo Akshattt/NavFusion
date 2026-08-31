@@ -3,51 +3,103 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from PIL import Image
 from nuscenes.utils.data_classes import LidarPointCloud
+from nuscenes.utils.geometry_utils import view_points
+from pyquaternion import Quaternion
+from ultralytics import YOLO
+import numpy as np
 
 from navfusion.dataset.nuscenes_loader import NuScenesLoader
-import numpy as np
-from pyquaternion import Quaternion
-from nuscenes.utils.geometry_utils import view_points
-
 
 
 DATASET_ROOT = Path(
     r"C:\Users\Mettle\Documents\PythonProjects\NavFusion\Datasets\nuScenes"
 )
 
-#nuScenes sensor chanel names:
+# nuScenes sensor channel names.
 CAMERA_CHANNEL = "CAM_FRONT"
 LIDAR_CHANNEL = "LIDAR_TOP"
 
-# Only display LiDAR points within +/- 50 meters in x and y.
+# Only display raw LiDAR points within +/- 50 metres.
 VISUALIZATION_RANGE_M = 50.0
 
-def getSensorRecordAndPath(loader, sample, sensor_channel):
-    if sensor_channel not in sample["data"]:
+# --------------------------------------------------------------
+# YOLO CONFIGURATION
+# --------------------------------------------------------------
+
+# YOLO11 nano is small and fast enough for our first implementation.
+YOLO_MODEL_NAME = "yolo11n.pt"
+
+# Ignore weak detections below this confidence.
+YOLO_CONFIDENCE = 0.35
+
+# Vehicle classes from the standard COCO labels used by YOLO.
+VEHICLE_CLASSES = {
+    "car",
+    "truck",
+    "bus",
+    "motorcycle"
+}
+
+# Shrink each YOLO bounding box before associating LiDAR points.
+#
+# The previous Visual Fusion project showed why:
+# LiDAR points near the edges of a rectangular detection box may
+# actually belong to the background or another nearby object.
+#
+# 0.10 means remove 10% from EACH side.
+BOUNDING_BOX_SHRINK_FACTOR = 0.10
+
+# Require at least this many LiDAR points before trusting an
+# object-distance estimate.
+MIN_LIDAR_POINTS_PER_OBJECT = 3
+
+# MAD threshold used for robust depth-outlier rejection.
+MAD_SCALE = 3.0
+
+
+def getSensorRecordAndPath(
+    loader,
+    sample,
+    sensorChannel
+):
+    """Return sensor metadata and its physical data-file path."""
+
+    if sensorChannel not in sample["data"]:
         raise KeyError(
-            f"Sensor Channel '{sensor_channel}' is not present in sample data."
+            f"Sensor channel '{sensorChannel}' "
+            f"is not present in sample data."
         )
 
-    sample_data_token = sample["data"][sensor_channel]
+    sampleDataToken = sample["data"][sensorChannel]
 
-    sensor_record = loader.nusc.get(
+    sensorRecord = loader.nusc.get(
         "sample_data",
-        sample_data_token)
+        sampleDataToken
+    )
 
-    sensor_path = loader.dataroot / sensor_record["filename"]
+    sensorPath = (
+        loader.dataroot
+        / sensorRecord["filename"]
+    )
 
-    if not sensor_path.is_file():
+    if not sensorPath.is_file():
         raise FileNotFoundError(
-            f"{sensor_channel} file not found: {sensor_path}"
+            f"{sensorChannel} file not found: "
+            f"{sensorPath}"
         )
 
-    return sensor_record, sensor_path
+    return sensorRecord, sensorPath
 
 
-#from lidar to car
+# --------------------------------------------------------------
+# LIDAR -> CAMERA GEOMETRIC TRANSFORMATIONS
+# --------------------------------------------------------------
 
-def lidarToCar(pointCloud, lidarCalibration):
-    #transform lidar from to car coordinate frame
+def lidarToCar(
+    pointCloud,
+    lidarCalibration
+):
+    """Transform LiDAR-frame points into the car coordinate frame."""
 
     lidarRotation = Quaternion(
         lidarCalibration["rotation"]
@@ -57,13 +109,23 @@ def lidarToCar(pointCloud, lidarCalibration):
         lidarCalibration["translation"]
     )
 
-    pointCloud.rotate(lidarRotation)
-    pointCloud.translate(lidarTranslation)
+    pointCloud.rotate(
+        lidarRotation
+    )
+
+    pointCloud.translate(
+        lidarTranslation
+    )
 
     return pointCloud
 
-#car coordinates to global coordinates
-def carToGlobal(pointCloud, carPose):
+
+def carToGlobal(
+    pointCloud,
+    carPose
+):
+    """Transform car-frame points into the global coordinate frame."""
+
     carRotation = Quaternion(
         carPose["rotation"]
     ).rotation_matrix
@@ -72,13 +134,22 @@ def carToGlobal(pointCloud, carPose):
         carPose["translation"]
     )
 
-    pointCloud.rotate(carRotation)
-    pointCloud.translate(carTranslation)
+    pointCloud.rotate(
+        carRotation
+    )
+
+    pointCloud.translate(
+        carTranslation
+    )
 
     return pointCloud
 
-def globalToCar(pointCloud, carPose):
-    #transform global frame to car coordinates frame.
+
+def globalToCar(
+    pointCloud,
+    carPose
+):
+    """Transform global-frame points into a car coordinate frame."""
 
     carTranslation = np.array(
         carPose["translation"]
@@ -88,23 +159,28 @@ def globalToCar(pointCloud, carPose):
         carPose["rotation"]
     ).rotation_matrix
 
-    #to make the points negative
-
+    # Undo the car's global translation.
     pointCloud.translate(
         -carTranslation
     )
 
-    # Undo the car's global rotation.
-    # For a rotation matrix: inverse(R) = transpose(R)
-
+    # Undo its global rotation.
+    #
+    # For a rotation matrix:
+    #
+    # inverse(R) = transpose(R)
     pointCloud.rotate(
         carRotation.T
     )
 
     return pointCloud
 
-def carToCamera(pointCloud, cameraCalibration):
-    #Transform car frame point into the camera coordinate frame"
+
+def carToCamera(
+    pointCloud,
+    cameraCalibration
+):
+    """Transform car-frame points into the camera coordinate frame."""
 
     cameraTranslation = np.array(
         cameraCalibration["translation"]
@@ -114,9 +190,9 @@ def carToCamera(pointCloud, cameraCalibration):
         cameraCalibration["rotation"]
     ).rotation_matrix
 
-    #cameraCalibration describes camera 
-    #we need car, camera, so we apply the inverse transformation
-
+    # cameraCalibration describes camera -> car.
+    #
+    # We need car -> camera, so apply the inverse.
     pointCloud.translate(
         -cameraTranslation
     )
@@ -128,14 +204,14 @@ def carToCamera(pointCloud, cameraCalibration):
     return pointCloud
 
 
-def cameraToImage(pointCloud, cameraCalibration):
+def cameraToImage(
+    pointCloud,
+    cameraCalibration
+):
+    """Project camera-frame 3D points onto the 2D image plane."""
 
-    #here z is the depth of the camera
-
-    depths = pointCloud.points[2,:]
-
-    #nuScenes states the camera intinrsic matrix as a python list
-    #convert it to a numpy array firsts
+    # In the camera coordinate frame, z is depth.
+    depths = pointCloud.points[2, :]
 
     cameraIntrinsic = np.array(
         cameraCalibration["camera_intrinsic"]
@@ -150,91 +226,485 @@ def cameraToImage(pointCloud, cameraCalibration):
     return points2d, depths
 
 
-
-# Run the complete LiDAR -> camera projection pipeline.
 def projectLidarToCamera(
     loader,
     lidarPointCloud,
     lidarRecord,
     cameraRecord
 ):
-    """Transform LiDAR points into camera pixels."""
+    """Run the complete LiDAR -> camera projection pipeline."""
 
-    # Make a copy because rotate() and translate() modify the point cloud.
+    # rotate() and translate() modify the object in place,
+    # so use a copy.
     pointCloud = LidarPointCloud(
         lidarPointCloud.points.copy()
     )
 
-    # Get LiDAR mounting position/orientation relative to the car.
     lidarCalibration = loader.nusc.get(
         "calibrated_sensor",
         lidarRecord["calibrated_sensor_token"]
     )
 
-    # Get the car pose when the LiDAR scan was captured.
     lidarCarPose = loader.nusc.get(
         "ego_pose",
         lidarRecord["ego_pose_token"]
     )
 
-    # Get the car pose when the camera image was captured.
     cameraCarPose = loader.nusc.get(
         "ego_pose",
         cameraRecord["ego_pose_token"]
     )
 
-    # Get camera mounting calibration and camera intrinsic matrix.
     cameraCalibration = loader.nusc.get(
         "calibrated_sensor",
         cameraRecord["calibrated_sensor_token"]
     )
 
-    # LiDAR coordinates -> car coordinates at LiDAR timestamp.
+    # LiDAR -> car at LiDAR time.
     pointCloud = lidarToCar(
         pointCloud,
         lidarCalibration
     )
 
-    # Car coordinates at LiDAR timestamp -> global coordinates.
+    # Car at LiDAR time -> global.
     pointCloud = carToGlobal(
         pointCloud,
         lidarCarPose
     )
 
-    # Global coordinates -> car coordinates at camera timestamp.
+    # Global -> car at camera time.
     pointCloud = globalToCar(
         pointCloud,
         cameraCarPose
     )
 
-    # Car coordinates -> camera 3D coordinates.
+    # Car -> camera.
     pointCloud = carToCamera(
         pointCloud,
         cameraCalibration
     )
 
-    # Camera 3D coordinates -> image pixel coordinates.
+    # Camera 3D -> image pixels.
     points2d, depths = cameraToImage(
         pointCloud,
         cameraCalibration
     )
 
     return points2d, depths
-    
 
 
+# --------------------------------------------------------------
+# YOLO OBJECT DETECTION
+# --------------------------------------------------------------
+
+def runVehicleDetection(
+    model,
+    cameraImage
+):
+    """Detect vehicles in the front-camera image with YOLO11."""
+
+    # Convert PIL RGB image into a NumPy RGB image.
+    imageArray = np.array(
+        cameraImage
+    )
+
+    results = model.predict(
+        source=imageArray,
+        conf=YOLO_CONFIDENCE,
+        verbose=False
+    )
+
+    result = results[0]
+
+    detections = []
+
+    if result.boxes is None:
+        return detections
+
+    for box in result.boxes:
+
+        classId = int(
+            box.cls[0].item()
+        )
+
+        className = result.names[
+            classId
+        ]
+
+        # For now only keep vehicle classes.
+        if className not in VEHICLE_CLASSES:
+            continue
+
+        confidence = float(
+            box.conf[0].item()
+        )
+
+        # xyxy gives:
+        #
+        # [left, top, right, bottom]
+        x1, y1, x2, y2 = (
+            box.xyxy[0]
+            .cpu()
+            .numpy()
+        )
+
+        detection = {
+            "className": className,
+            "confidence": confidence,
+            "box": np.array(
+                [x1, y1, x2, y2],
+                dtype=np.float32
+            )
+        }
+
+        detections.append(
+            detection
+        )
+
+    return detections
 
 
+# --------------------------------------------------------------
+# BOUNDING-BOX SHRINKING
+# --------------------------------------------------------------
+
+def shrinkBoundingBox(
+    box,
+    shrinkFactor
+):
+    """
+    Shrink a detection box inward from all four sides.
+
+    This reduces the chance that LiDAR points near the outer
+    boundary actually belong to the background.
+    """
+
+    x1, y1, x2, y2 = box
+
+    width = x2 - x1
+    height = y2 - y1
+
+    xShrink = (
+        width
+        * shrinkFactor
+    )
+
+    yShrink = (
+        height
+        * shrinkFactor
+    )
+
+    shrunkBox = np.array(
+        [
+            x1 + xShrink,
+            y1 + yShrink,
+            x2 - xShrink,
+            y2 - yShrink
+        ],
+        dtype=np.float32
+    )
+
+    return shrunkBox
 
 
+# --------------------------------------------------------------
+# ROBUST DEPTH OUTLIER REMOVAL
+# --------------------------------------------------------------
+
+def filterDepthsWithMad(
+    depths
+):
+    """
+    Remove depth outliers using Median Absolute Deviation (MAD).
+
+    MAD is more robust than mean/std when a YOLO box contains
+    a few background LiDAR points.
+    """
+
+    if depths.size == 0:
+        return np.zeros(
+            0,
+            dtype=bool
+        )
+
+    medianDepth = np.median(
+        depths
+    )
+
+    absoluteDeviation = np.abs(
+        depths - medianDepth
+    )
+
+    mad = np.median(
+        absoluteDeviation
+    )
+
+    # If MAD is exactly zero, most depths are identical or nearly
+    # identical. Do not reject them unnecessarily.
+    if mad < 1e-6:
+        return np.ones(
+            depths.shape,
+            dtype=bool
+        )
+
+    # 1.4826 makes MAD comparable to standard deviation for a
+    # normally distributed variable.
+    robustSigma = (
+        1.4826
+        * mad
+    )
+
+    inlierMask = (
+        absoluteDeviation
+        <= MAD_SCALE * robustSigma
+    )
+
+    return inlierMask
 
 
+# --------------------------------------------------------------
+# ASSOCIATE LIDAR WITH YOLO VEHICLES
+# --------------------------------------------------------------
+
+def associateLidarWithVehicles(
+    detections,
+    points2d,
+    depths,
+    fusionMask,
+    originalLidarPoints
+):
+    """
+    Associate projected LiDAR returns with each YOLO vehicle.
+
+    The same point index is preserved between:
+        originalLidarPoints[:, i]
+        points2d[:, i]
+        depths[i]
+
+    Therefore a LiDAR point found inside a YOLO bounding box
+    can also be located metrically in LiDAR x/y/z.
+    """
+
+    u = points2d[0, :]
+    v = points2d[1, :]
+
+    fusedObjects = []
+
+    for detection in detections:
+
+        shrunkBox = shrinkBoundingBox(
+            detection["box"],
+            BOUNDING_BOX_SHRINK_FACTOR
+        )
+
+        x1, y1, x2, y2 = shrunkBox
+
+        # A LiDAR point belongs to this vehicle candidate when:
+        #
+        # 1. It survived the camera FOV mask.
+        # 2. Its projected u coordinate lies inside the box.
+        # 3. Its projected v coordinate lies inside the box.
+        objectMask = (
+            fusionMask
+            & (u >= x1)
+            & (u <= x2)
+            & (v >= y1)
+            & (v <= y2)
+        )
+
+        objectIndices = np.flatnonzero(
+            objectMask
+        )
+
+        if (
+            objectIndices.size
+            < MIN_LIDAR_POINTS_PER_OBJECT
+        ):
+            continue
+
+        objectDepths = depths[
+            objectIndices
+        ]
+
+        # Remove depth outliers.
+        depthInlierMask = filterDepthsWithMad(
+            objectDepths
+        )
+
+        cleanIndices = objectIndices[
+            depthInlierMask
+        ]
+
+        cleanDepths = depths[
+            cleanIndices
+        ]
+
+        if (
+            cleanIndices.size
+            < MIN_LIDAR_POINTS_PER_OBJECT
+        ):
+            continue
+
+        # ----------------------------------------------------------
+        # OBJECT DISTANCE
+        # ----------------------------------------------------------
+
+        # Use the median rather than mean so a few remaining
+        # unusual returns cannot pull the object distance strongly.
+        distanceM = float(
+            np.median(
+                cleanDepths
+            )
+        )
+
+        # ----------------------------------------------------------
+        # ORIGINAL LIDAR XYZ POSITION
+        # ----------------------------------------------------------
+
+        # originalLidarPoints still has the same column ordering
+        # as the projected points.
+        objectLidarPoints = originalLidarPoints[
+            :3,
+            cleanIndices
+        ]
+
+        # Median x/y/z provides one representative object location.
+        lidarXM = float(
+            np.median(
+                objectLidarPoints[0, :]
+            )
+        )
+
+        lidarYM = float(
+            np.median(
+                objectLidarPoints[1, :]
+            )
+        )
+
+        lidarZM = float(
+            np.median(
+                objectLidarPoints[2, :]
+            )
+        )
+
+        fusedObject = {
+            "className": detection["className"],
+            "confidence": detection["confidence"],
+            "box": detection["box"],
+            "shrunkBox": shrunkBox,
+            "distanceM": distanceM,
+            "lidarXM": lidarXM,
+            "lidarYM": lidarYM,
+            "lidarZM": lidarZM,
+            "rawLidarCount": objectIndices.size,
+            "cleanLidarCount": cleanIndices.size,
+            "cleanIndices": cleanIndices
+        }
+
+        fusedObjects.append(
+            fusedObject
+        )
+
+    return fusedObjects
+
+
+# --------------------------------------------------------------
+# DRAW YOLO + LIDAR FUSION
+# --------------------------------------------------------------
+
+def drawVehicleFusion(
+    axis,
+    cameraImage,
+    points2d,
+    depths,
+    fusionMask,
+    fusedObjects
+):
+    """Draw YOLO boxes, LiDAR returns, and vehicle distances."""
+
+    axis.imshow(
+        cameraImage
+    )
+
+    # Show all camera-visible LiDAR returns faintly.
+    axis.scatter(
+        points2d[0, fusionMask],
+        points2d[1, fusionMask],
+        c=depths[fusionMask],
+        s=3,
+        cmap="viridis",
+        alpha=0.35
+    )
+
+    for fusedObject in fusedObjects:
+
+        x1, y1, x2, y2 = fusedObject[
+            "box"
+        ]
+
+        width = x2 - x1
+        height = y2 - y1
+
+        rectangle = plt.Rectangle(
+            (x1, y1),
+            width,
+            height,
+            fill=False,
+            linewidth=2
+        )
+
+        axis.add_patch(
+            rectangle
+        )
+
+        # Highlight only the robust LiDAR points associated with
+        # this particular vehicle.
+        cleanIndices = fusedObject[
+            "cleanIndices"
+        ]
+
+        axis.scatter(
+            points2d[0, cleanIndices],
+            points2d[1, cleanIndices],
+            s=12
+        )
+
+        label = (
+            f"{fusedObject['className']} "
+            f"{fusedObject['confidence']:.2f}\n"
+            f"{fusedObject['distanceM']:.2f} m"
+        )
+
+        axis.text(
+            x1,
+            max(
+                15,
+                y1 - 8
+            ),
+            label,
+            fontsize=9,
+            bbox={
+                "facecolor": "white",
+                "alpha": 0.75,
+                "edgecolor": "none"
+            }
+        )
+
+    axis.set_title(
+        "YOLO11 + LiDAR Vehicle Distance"
+    )
+
+    axis.axis(
+        "off"
+    )
 
 
 def main():
-    """ Load and visualize the first sample from the first scene in the nuScenes dataset. """
+    """Load and visualize the first sample from the first scene."""
 
-    #to use the Navfusion dataset again and again.
+    # --------------------------------------------------------------
+    # LOAD DATASET
+    # --------------------------------------------------------------
 
     loader = NuScenesLoader(
         dataroot=DATASET_ROOT,
@@ -242,60 +712,68 @@ def main():
         verbose=True
     )
 
-    #loader.nusc.scene is a python list of dictionaries, where each dictionary represents a scene in the nuScenes dataset.
     scene = loader.nusc.scene[0]
 
-    first_sample_token = scene["first_sample_token"]
+    firstSampleToken = scene[
+        "first_sample_token"
+    ]
 
     sample = loader.nusc.get(
         "sample",
-        first_sample_token
+        firstSampleToken
     )
 
-    #now we have to get the camera metadata and the physical JPEG Path
-    camera_record, camera_path = getSensorRecordAndPath(
+    cameraRecord, cameraPath = getSensorRecordAndPath(
         loader,
         sample,
         CAMERA_CHANNEL
     )
 
-    lidar_record, lidar_path = getSensorRecordAndPath(
+    lidarRecord, lidarPath = getSensorRecordAndPath(
         loader,
         sample,
         LIDAR_CHANNEL
     )
 
-        # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # CAMERA DATA
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
-    # Read the JPEG and convert it to RGB.
-    camera_image = Image.open(camera_path).convert("RGB")
+    cameraImage = Image.open(
+        cameraPath
+    ).convert(
+        "RGB"
+    )
 
-        # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # LIDAR DATA
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
-    # Read the binary LiDAR file using the official nuScenes SDK.
-    
-    lidar_pointCloud = LidarPointCloud.from_file(
-        str(lidar_path)
+    lidarPointCloud = LidarPointCloud.from_file(
+        str(lidarPath)
+    )
+
+    # Preserve the original LiDAR points before any geometric
+    # projection transformations.
+    originalLidarPoints = (
+        lidarPointCloud.points.copy()
     )
 
     points2d, depths = projectLidarToCamera(
         loader,
-        lidar_pointCloud,
-        lidar_record,
-        camera_record
+        lidarPointCloud,
+        lidarRecord,
+        cameraRecord
     )
 
-    # Get the camera image dimensions.
-    imageWidth, imageHeight = camera_image.size
+    imageWidth, imageHeight = (
+        cameraImage.size
+    )
 
-    # Keep only projected LiDAR points that:
-    # 1. are in front of the camera,
-    # 2. fall inside the horizontal image boundary,
-    # 3. fall inside the vertical image boundary.
+    # --------------------------------------------------------------
+    # CAMERA FOV MASK
+    # --------------------------------------------------------------
+
     fusionMask = (
         (depths > 1.0)
         & (points2d[0, :] >= 0)
@@ -304,101 +782,227 @@ def main():
         & (points2d[1, :] < imageHeight)
     )
 
-        # points is a NumPy array with shape (4, N):
-    #
-    # row 0 -> x
-    # row 1 -> y
-    # row 2 -> z
-    # row 3 -> intensity
-    #
-    # N = number of LiDAR returns.
+    # --------------------------------------------------------------
+    # RAW LIDAR DATA
+    # --------------------------------------------------------------
 
-    points = lidar_pointCloud.points
+    points = lidarPointCloud.points
 
-    # Extract each row into a separate 1-D Numpy array.
     x = points[0, :]
     y = points[1, :]
     z = points[2, :]
     intensity = points[3, :]
 
-    range_mask = (
-        (x > -VISUALIZATION_RANGE_M) 
-        &(y > -VISUALIZATION_RANGE_M)
-        &(x < VISUALIZATION_RANGE_M)
-        &(y < VISUALIZATION_RANGE_M) 
+    rangeMask = (
+        (x > -VISUALIZATION_RANGE_M)
+        & (y > -VISUALIZATION_RANGE_M)
+        & (x < VISUALIZATION_RANGE_M)
+        & (y < VISUALIZATION_RANGE_M)
     )
 
-    x_visible = x[range_mask]
-    y_visible = y[range_mask]
+    xVisible = x[
+        rangeMask
+    ]
 
-    #For printing information
+    yVisible = y[
+        rangeMask
+    ]
 
-    print("Navfusion Sensor Visualization")
+    # --------------------------------------------------------------
+    # YOLO11 DETECTION
+    # --------------------------------------------------------------
+
+    print("\nLoading YOLO11 model...")
+
+    yoloModel = YOLO(
+        YOLO_MODEL_NAME
+    )
+
+    detections = runVehicleDetection(
+        yoloModel,
+        cameraImage
+    )
+
+    # --------------------------------------------------------------
+    # LIDAR + YOLO ASSOCIATION
+    # --------------------------------------------------------------
+
+    fusedObjects = associateLidarWithVehicles(
+        detections,
+        points2d,
+        depths,
+        fusionMask,
+        originalLidarPoints
+    )
+
+    # --------------------------------------------------------------
+    # DIAGNOSTICS
+    # --------------------------------------------------------------
+
+    print("\nNavFusion Sensor Visualization")
     print("================================")
-    print(f"Scene Name: {scene['name']}")
-    print(f"Sample Token: {sample['token']}")
+
+    print(
+        f"Scene Name       : "
+        f"{scene['name']}"
+    )
+
+    print(
+        f"Sample Token     : "
+        f"{sample['token']}"
+    )
 
     print("\nCAM_FRONT Sensor Record:")
     print("-------------------------")
-    print(f"File             : {camera_path}")
-    print(f"Image size       : {camera_image.size}")
-    print(f"Timestamp        : {camera_record['timestamp']}")
+
+    print(
+        f"File             : "
+        f"{cameraPath}"
+    )
+
+    print(
+        f"Image size       : "
+        f"{cameraImage.size}"
+    )
+
+    print(
+        f"Timestamp        : "
+        f"{cameraRecord['timestamp']}"
+    )
 
     print("\nLIDAR_TOP Sensor Record:")
     print("-------------------------")
-    print(f"File             : {lidar_path}")
-    print(f"Point array      : {points.shape}")
-    print(f"Number of points : {points.shape[1]}")
-    print(f"Visible points   : {x_visible.shape[0]}")
-    print(f"Timestamp        : {lidar_record['timestamp']}")
-    print("\nLiDAR -> Camera Projection:")
-    print("---------------------------")
-    print(f"2D point array   : {points2d.shape}")
-    print(f"Depth array      : {depths.shape}")
-    print("First 5 projected points:")
-    print(points2d[:, :5].T)
-    print("First 5 depths:")
-    print(depths[:5])
-    print(f"Points inside image: {fusionMask.sum()}")
 
-    print("Print 5 lidar points: ")
-    print("[x y z intensity]")
-    print(points[:, :5].T)
-
-    print("\nCoordinate ranges:")
-    print(f"x         : {x.min():.2f} to {x.max():.2f} m")
-    print(f"y         : {y.min():.2f} to {y.max():.2f} m")
-    print(f"z         : {z.min():.2f} to {z.max():.2f} m")
-    print(f"intensity : {intensity.min():.2f} to {intensity.max():.2f}")
-
-        # ------------------------------------------------------------------
-    # VISUALIZATION
-    # ------------------------------------------------------------------
-
-    figure, axes = plt.subplots(
-        1,
-        3,
-        figsize=(22, 7)
+    print(
+        f"File             : "
+        f"{lidarPath}"
     )
 
-    # Left side: front-camera image.
-    axes[0].imshow(camera_image)
-    axes[0].set_title("CAM_FRONT")
-    axes[0].axis("off")
+    print(
+        f"Point array      : "
+        f"{points.shape}"
+    )
 
-    # Right side: raw LiDAR viewed from above.
-    #
-    # Horizontal plotting axis = LiDAR y
-    # Vertical plotting axis   = LiDAR x
-    #
-    # This makes vehicle-forward (+x) appear toward the top.
+    print(
+        f"Number of points : "
+        f"{points.shape[1]}"
+    )
+
+    print(
+        f"Visible points   : "
+        f"{xVisible.shape[0]}"
+    )
+
+    print(
+        f"Timestamp        : "
+        f"{lidarRecord['timestamp']}"
+    )
+
+    print("\nLiDAR -> Camera Projection:")
+    print("---------------------------")
+
+    print(
+        f"2D point array   : "
+        f"{points2d.shape}"
+    )
+
+    print(
+        f"Depth array      : "
+        f"{depths.shape}"
+    )
+
+    print(
+        f"Points inside image: "
+        f"{fusionMask.sum()}"
+    )
+
+    print("\nYOLO11 Vehicle Detection:")
+    print("-------------------------")
+
+    print(
+        f"Vehicle detections : "
+        f"{len(detections)}"
+    )
+
+    print(
+        f"Fused vehicles     : "
+        f"{len(fusedObjects)}"
+    )
+
+    for objectNumber, fusedObject in enumerate(
+        fusedObjects,
+        start=1
+    ):
+
+        print(
+            f"\nObject {objectNumber}:"
+        )
+
+        print(
+            f"Class             : "
+            f"{fusedObject['className']}"
+        )
+
+        print(
+            f"Confidence        : "
+            f"{fusedObject['confidence']:.3f}"
+        )
+
+        print(
+            f"Distance          : "
+            f"{fusedObject['distanceM']:.2f} m"
+        )
+
+        print(
+            f"LiDAR position    : "
+            f"x={fusedObject['lidarXM']:.2f}, "
+            f"y={fusedObject['lidarYM']:.2f}, "
+            f"z={fusedObject['lidarZM']:.2f} m"
+        )
+
+        print(
+            f"LiDAR points      : "
+            f"{fusedObject['rawLidarCount']} raw -> "
+            f"{fusedObject['cleanLidarCount']} filtered"
+        )
+
+    # --------------------------------------------------------------
+    # VISUALIZATION
+    # --------------------------------------------------------------
+
+    # Keep the previous stages visible rather than replacing them.
+    figure, axes = plt.subplots(
+        1,
+        4,
+        figsize=(28, 7)
+    )
+
+    # --------------------------------------------------------------
+    # PANEL 1: CAMERA
+    # --------------------------------------------------------------
+
+    axes[0].imshow(
+        cameraImage
+    )
+
+    axes[0].set_title(
+        "CAM_FRONT"
+    )
+
+    axes[0].axis(
+        "off"
+    )
+
+    # --------------------------------------------------------------
+    # PANEL 2: RAW LIDAR
+    # --------------------------------------------------------------
+
     axes[1].scatter(
-        y_visible,
-        x_visible,
+        yVisible,
+        xVisible,
         s=0.5
     )
 
-    # In the LiDAR's own coordinate system, the sensor is at (0, 0).
     axes[1].scatter(
         0,
         0,
@@ -407,9 +1011,17 @@ def main():
         label="LiDAR sensor"
     )
 
-    axes[1].set_title("LIDAR_TOP - Raw Sensor-Frame XY View")
-    axes[1].set_xlabel("y - left/right (m)")
-    axes[1].set_ylabel("x - forward/backward (m)")
+    axes[1].set_title(
+        "LIDAR_TOP - Raw Sensor-Frame XY"
+    )
+
+    axes[1].set_xlabel(
+        "y - left/right (m)"
+    )
+
+    axes[1].set_ylabel(
+        "x - forward/backward (m)"
+    )
 
     axes[1].set_xlim(
         -VISUALIZATION_RANGE_M,
@@ -421,14 +1033,23 @@ def main():
         VISUALIZATION_RANGE_M
     )
 
-    # One meter on the x-axis should visually equal one meter on the y-axis.
-    axes[1].set_aspect("equal")
+    axes[1].set_aspect(
+        "equal"
+    )
 
-    axes[1].grid(True)
+    axes[1].grid(
+        True
+    )
+
     axes[1].legend()
 
-    # Third panel: projected LiDAR points over the camera image.
-    axes[2].imshow(camera_image)
+    # --------------------------------------------------------------
+    # PANEL 3: ORIGINAL LIDAR-CAMERA PROJECTION
+    # --------------------------------------------------------------
+
+    axes[2].imshow(
+        cameraImage
+    )
 
     fusionScatter = axes[2].scatter(
         points2d[0, fusionMask],
@@ -438,59 +1059,73 @@ def main():
         cmap="viridis"
     )
 
-    axes[2].set_title("CAM_FRONT + LIDAR_TOP Fusion")
-    axes[2].axis("off")
+    axes[2].set_title(
+        "CAM_FRONT + LIDAR_TOP Fusion"
+    )
 
-    # Show what the point colors mean.
+    axes[2].axis(
+        "off"
+    )
+
     figure.colorbar(
         fusionScatter,
         ax=axes[2],
         label="Depth (m)"
     )
 
+    # --------------------------------------------------------------
+    # PANEL 4: YOLO + LIDAR DISTANCE
+    # --------------------------------------------------------------
+
+    drawVehicleFusion(
+        axes[3],
+        cameraImage,
+        points2d,
+        depths,
+        fusionMask,
+        fusedObjects
+    )
+
     figure.tight_layout()
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # SAVE OUTPUT
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
-    # Current file:
-    # NavFusion\Code\scripts\02_visualize_sensors.py
-    #
-    # parents[0] = scripts
-    # parents[1] = Code
-    # parents[2] = NavFusion
-    project_root = Path(__file__).resolve().parents[2]
+    projectRoot = (
+        Path(__file__)
+        .resolve()
+        .parents[2]
+    )
 
-    output_directory = project_root / "Outputs"
+    outputDirectory = (
+        projectRoot
+        / "Outputs"
+    )
 
-    # Create Outputs if it does not already exist.
-    output_directory.mkdir(
+    outputDirectory.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    output_path = (
-        output_directory
-        / "scene_0_first_sample_sensor_visualization.png"
+    outputPath = (
+        outputDirectory
+        / "scene_0_first_sample_yolo_lidar_fusion.png"
     )
 
     figure.savefig(
-        output_path,
+        outputPath,
         dpi=150,
         bbox_inches="tight"
     )
 
-    print(f"\nVisualization saved to:\n{output_path}")
+    print(
+        f"\nVisualization saved to:\n"
+        f"{outputPath}"
+    )
 
-    # Keep the Matplotlib visualization window open.
     plt.show()
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
