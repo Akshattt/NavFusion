@@ -1,6 +1,9 @@
 from pathlib import Path
+import shutil
+import subprocess
 
 import matplotlib.pyplot as plt
+import numpy as np
 from PIL import Image
 from nuscenes.utils.data_classes import LidarPointCloud
 from ultralytics import YOLO
@@ -8,16 +11,42 @@ from ultralytics import YOLO
 from navfusion.dataset.nuscenes_loader import NuScenesLoader
 from navfusion.perception.sensor_fusion import processSensorFusion
 from navfusion.mapping.lidar_bev import processLidarBev
+from navfusion.mapping.semantic_bev import createSemanticBev
 from navfusion.visualization.sensor_fusion_visualizer import (
     createSensorFusionFigure
 )
 
 
 # ==============================================================
+# OUTPUT MODE
+# ==============================================================
+
+# This is the ONLY mode flag.
+#
+# "photo"
+#     Process exactly one sample:
+#
+#         first scene
+#         first sample
+#
+#     Save one semantic-BEV PNG and display it.
+#
+# "video"
+#     Process every scene and every sample in nuScenes-mini.
+#
+#     Do not display figures.
+#     Do not save individual PNG files.
+#     Save one protected semantic-BEV MP4.
+#
+# For the current full-dataset video run:
+outputMode = "video"
+
+
+# ==============================================================
 # Project paths
 # ==============================================================
 
-# This file is located at:
+# This file:
 #
 # NavFusion\Code\run_navfusion.py
 #
@@ -48,47 +77,6 @@ outputDirectory = (
 
 datasetVersion = "v1.0-mini"
 
-
-# ==============================================================
-# Data selection
-# ==============================================================
-
-# sceneIndex controls which scenes enter the pipeline.
-#
-# sceneIndex = 0
-#     Process only the first scene.
-#
-# sceneIndex = 3
-#     Process only scene index 3.
-#
-# sceneIndex = None
-#     Process every scene in the dataset.
-#
-# For current verification:
-sceneIndex = 0
-
-
-# maxSamples is a global sample limit.
-#
-# maxSamples = 1
-#     Process one sample total.
-#
-# maxSamples = 20
-#     Process twenty samples total.
-#
-# maxSamples = None
-#     Do not stop early.
-#
-# Entire dataset:
-#
-# sceneIndex = None
-# maxSamples = None
-#
-# For current verification:
-maxSamples = 1
-
-
-# These strings are exact nuScenes channel names.
 cameraChannel = "CAM_FRONT"
 
 lidarChannel = "LIDAR_TOP"
@@ -110,12 +98,14 @@ sensorFusionConfig = {
         "motorcycle"
     },
 
-    # Shrink 10% from each side of the detection box before
-    # associating projected LiDAR points.
+    # Shrink the YOLO box by 10 percent on each side before
+    # associating projected LiDAR returns.
     "boundingBoxShrinkFactor": 0.10,
 
+    # A fused object must contain at least this many LiDAR points.
     "minimumLidarPoints": 3,
 
+    # Median Absolute Deviation outlier-filter scale.
     "madScale": 3.0
 }
 
@@ -126,70 +116,70 @@ sensorFusionConfig = {
 
 bevConfig = {
     # ----------------------------------------------------------
-    # Physical BEV region
+    # Physical car-frame BEV region
     # ----------------------------------------------------------
 
     # x:
-    #     -20 m behind
-    #      50 m forward
+    #
+    # -20 m behind
+    # +50 m forward
     "xMinM": -20.0,
     "xMaxM": 50.0,
 
     # y:
-    #     -25 m to +25 m laterally
+    #
+    # -25 m right
+    # +25 m left
     "yMinM": -25.0,
     "yMaxM": 25.0,
 
     # Each BEV cell represents:
     #
     # 0.20 m x 0.20 m
+    #
+    # Therefore:
+    #
+    # 70 / 0.20 = 350 rows
+    # 50 / 0.20 = 250 columns
     "resolutionM": 0.20,
 
     # ----------------------------------------------------------
-    # Ground-candidate selection
+    # Ground candidate selection
     # ----------------------------------------------------------
 
-    # Select the lower portion of the LiDAR z distribution as
-    # possible ground points before RANSAC.
     "groundLowerPercentile": 5.0,
 
     "groundUpperPercentile": 35.0,
 
     # ----------------------------------------------------------
-    # RANSAC configuration
+    # RANSAC
     # ----------------------------------------------------------
 
-    # Number of random plane hypotheses.
     "ransacIterations": 500,
 
-    # A ground candidate is a RANSAC inlier if its perpendicular
-    # distance from the proposed plane is <= 10 cm.
+    # Ground candidate is an inlier when its perpendicular
+    # distance from the candidate plane is <= 10 cm.
     "ransacDistanceThresholdM": 0.10,
 
-    # Fixed random seed makes development runs reproducible.
+    # Makes development runs deterministic.
     "ransacRandomSeed": 42,
 
     # ----------------------------------------------------------
-    # Obstacle configuration
+    # Obstacle extraction
     # ----------------------------------------------------------
 
-    # Points more than 15 cm above the estimated ground surface
-    # become initial obstacle candidates.
+    # Point becomes an obstacle candidate when it is more than
+    # 15 cm above the estimated ground plane.
     "minimumObstacleHeightM": 0.15,
 
     # ----------------------------------------------------------
-    # Car / sensor self-return region
+    # LIDAR_TOP self-return region
     # ----------------------------------------------------------
+    #
+    # These values deliberately remain in RAW LIDAR_TOP
+    # coordinates because this self-return region was already
+    # validated in that coordinate frame.
 
-    # These coordinates are in the raw LIDAR_TOP sensor frame:
-    #
-    # +x = forward
-    # +y = left
-    # +z = up
-    #
-    # This region is intentionally small. It removes the dense
-    # structure previously observed immediately around LIDAR_TOP
-    # without masking a large arbitrary area around the car.
     "selfReturnXMinM": -0.8,
     "selfReturnXMaxM": 0.8,
 
@@ -207,20 +197,54 @@ bevConfig = {
 
 visualizationRangeM = 50.0
 
-saveImages = True
 
-# Keep True while maxSamples = 1.
+# ==============================================================
+# Video configuration
+# ==============================================================
+
+# nuScenes keyframes are approximately 2 Hz.
+videoFps = 2.0
+
+# IMPORTANT:
 #
-# For a whole-scene or whole-dataset run:
+# This filename is different from the earlier geometric-BEV video:
 #
-# showFigure = False
+#     navfusion_full_dataset.mp4
 #
-# Otherwise plt.show() blocks after every sample.
-showFigure = True
+# Therefore that earlier video is never touched by this run.
+semanticVideoFileName = (
+    "navfusion_semantic_bev_full_dataset.mp4"
+)
 
 
 # ==============================================================
-# Get one selected sensor record
+# Validate output mode
+# ==============================================================
+
+def validateOutputMode():
+    """
+    Validate the one user-controlled output mode.
+
+    Allowed values:
+
+        photo
+        video
+    """
+
+    validModes = {
+        "photo",
+        "video"
+    }
+
+    if outputMode not in validModes:
+        raise ValueError(
+            f"Invalid outputMode='{outputMode}'. "
+            f"Use either 'photo' or 'video'."
+        )
+
+
+# ==============================================================
+# Get sensor record and path
 # ==============================================================
 
 def getSensorRecordAndPath(
@@ -229,21 +253,26 @@ def getSensorRecordAndPath(
     sensorChannel
 ):
     """
-    Get the sample_data record and physical file path for the
-    sensor selected by this runner.
+    Get one exact nuScenes sample_data record and its physical
+    sensor-file path.
 
-    Dataset access happens here rather than inside the perception
-    or mapping algorithms.
+    Dataset selection remains the responsibility of this runner.
     """
 
-    if sensorChannel not in sample["data"]:
+    if sensorChannel not in sample[
+        "data"
+    ]:
         raise KeyError(
             f"Sensor channel '{sensorChannel}' "
             f"is not available in this sample."
         )
 
-    # sample["data"] maps sensor-channel names to sample_data
-    # tokens.
+    # sample["data"] is a dictionary mapping channel names such as
+    #
+    # CAM_FRONT
+    # LIDAR_TOP
+    #
+    # to sample_data tokens.
     sampleDataToken = sample[
         "data"
     ][
@@ -257,7 +286,9 @@ def getSensorRecordAndPath(
 
     sensorPath = (
         loader.dataroot
-        / sensorRecord["filename"]
+        / sensorRecord[
+            "filename"
+        ]
     )
 
     if not sensorPath.is_file():
@@ -266,11 +297,14 @@ def getSensorRecordAndPath(
             f"{sensorPath}"
         )
 
-    return sensorRecord, sensorPath
+    return (
+        sensorRecord,
+        sensorPath
+    )
 
 
 # ==============================================================
-# Load all source data for one selected sample
+# Load one synchronized frame
 # ==============================================================
 
 def loadFrameData(
@@ -278,22 +312,21 @@ def loadFrameData(
     sample
 ):
     """
-    Load every source-data object required for one sample.
+    Load all source data required for exactly one selected sample.
 
-    This is the boundary between:
+    This function is the boundary between:
 
-        dataset access
+        dataset selection/loading
 
     and:
 
-        perception / mapping algorithms.
+        perception/mapping algorithms.
 
-    The algorithms receive frameData and therefore process only
-    the exact data selected here.
+    The downstream modules only process this supplied frameData.
     """
 
     # ----------------------------------------------------------
-    # Select camera record
+    # Camera
     # ----------------------------------------------------------
 
     cameraRecord, cameraPath = getSensorRecordAndPath(
@@ -303,7 +336,7 @@ def loadFrameData(
     )
 
     # ----------------------------------------------------------
-    # Select LiDAR record
+    # LiDAR
     # ----------------------------------------------------------
 
     lidarRecord, lidarPath = getSensorRecordAndPath(
@@ -313,7 +346,7 @@ def loadFrameData(
     )
 
     # ----------------------------------------------------------
-    # Load camera image
+    # Camera image
     # ----------------------------------------------------------
 
     cameraImage = Image.open(
@@ -323,7 +356,7 @@ def loadFrameData(
     )
 
     # ----------------------------------------------------------
-    # Load LiDAR point cloud
+    # LiDAR point cloud
     # ----------------------------------------------------------
 
     lidarPointCloud = LidarPointCloud.from_file(
@@ -333,7 +366,7 @@ def loadFrameData(
     )
 
     # ----------------------------------------------------------
-    # Load LiDAR calibration
+    # LiDAR calibrated_sensor record
     # ----------------------------------------------------------
 
     lidarCalibration = loader.nusc.get(
@@ -344,7 +377,7 @@ def loadFrameData(
     )
 
     # ----------------------------------------------------------
-    # Load camera calibration
+    # Camera calibrated_sensor record
     # ----------------------------------------------------------
 
     cameraCalibration = loader.nusc.get(
@@ -355,10 +388,10 @@ def loadFrameData(
     )
 
     # ----------------------------------------------------------
-    # Load car pose at LiDAR timestamp
+    # Car pose at LiDAR timestamp
     # ----------------------------------------------------------
 
-    # "ego_pose" is an exact nuScenes schema/table name.
+    # "ego_pose" is the exact nuScenes schema/table name.
     lidarCarPose = loader.nusc.get(
         "ego_pose",
         lidarRecord[
@@ -367,7 +400,7 @@ def loadFrameData(
     )
 
     # ----------------------------------------------------------
-    # Load car pose at camera timestamp
+    # Car pose at camera timestamp
     # ----------------------------------------------------------
 
     cameraCarPose = loader.nusc.get(
@@ -378,28 +411,34 @@ def loadFrameData(
     )
 
     # ----------------------------------------------------------
-    # Package the exact data for this frame
+    # Package synchronized source data
     # ----------------------------------------------------------
 
     frameData = {
         "sample": sample,
 
         "cameraChannel": cameraChannel,
+
         "lidarChannel": lidarChannel,
 
         "cameraRecord": cameraRecord,
+
         "lidarRecord": lidarRecord,
 
         "cameraPath": cameraPath,
+
         "lidarPath": lidarPath,
 
         "cameraImage": cameraImage,
+
         "lidarPointCloud": lidarPointCloud,
 
         "cameraCalibration": cameraCalibration,
+
         "lidarCalibration": lidarCalibration,
 
         "cameraCarPose": cameraCarPose,
+
         "lidarCarPose": lidarCarPose
     }
 
@@ -407,7 +446,7 @@ def loadFrameData(
 
 
 # ==============================================================
-# Print sensor-fusion results
+# Print sensor-fusion summary
 # ==============================================================
 
 def printSensorFusionSummary(
@@ -416,8 +455,7 @@ def printSensorFusionSummary(
     sensorResult
 ):
     """
-    Print camera, LiDAR, YOLO and LiDAR-object fusion results for
-    one synchronized sample.
+    Print camera, YOLO and LiDAR-object association diagnostics.
     """
 
     print()
@@ -471,16 +509,6 @@ def printSensorFusionSummary(
     )
 
     print(
-        f"2D points    : "
-        f"{sensorResult['points2d'].shape}"
-    )
-
-    print(
-        f"Depth array  : "
-        f"{sensorResult['depths'].shape}"
-    )
-
-    print(
         f"In camera    : "
         f"{sensorResult['fusionMask'].sum()}"
     )
@@ -524,10 +552,17 @@ def printSensorFusionSummary(
         )
 
         print(
-            f"  LiDAR xyz    : "
+            f"  Raw LiDAR xyz: "
             f"x={fusedObject['lidarXM']:.2f}, "
             f"y={fusedObject['lidarYM']:.2f}, "
             f"z={fusedObject['lidarZM']:.2f} m"
+        )
+
+        print(
+            f"  Car-frame xyz: "
+            f"x={fusedObject['carXM']:.2f}, "
+            f"y={fusedObject['carYM']:.2f}, "
+            f"z={fusedObject['carZM']:.2f} m"
         )
 
         print(
@@ -538,28 +573,21 @@ def printSensorFusionSummary(
 
 
 # ==============================================================
-# Print RANSAC / BEV results
+# Print LiDAR BEV summary
 # ==============================================================
 
 def printLidarBevSummary(
     bevResult
 ):
     """
-    Print RANSAC ground estimation and self-return filtering
-    diagnostics for one LiDAR sample.
+    Print LiDAR-to-car calibration, RANSAC, obstacle filtering and
+    geometric BEV diagnostics.
     """
 
     groundA, groundB, groundC = bevResult[
         "planeCoefficients"
     ]
 
-    # Some points inside the self-return box may already have been
-    # classified as ground/non-obstacles.
-    #
-    # The exact number actually removed from the obstacle layer is
-    # the intersection:
-    #
-    # obstacleCandidateMask AND selfReturnMask
     removedSelfObstacleMask = (
         bevResult[
             "obstacleCandidateMask"
@@ -573,7 +601,11 @@ def printLidarBevSummary(
         removedSelfObstacleMask.sum()
     )
 
-    lidarSensorX, lidarSensorY, lidarSensorZ = bevResult[
+    (
+        lidarSensorX,
+        lidarSensorY,
+        lidarSensorZ
+    ) = bevResult[
         "lidarSensorPositionCarM"
     ]
 
@@ -639,8 +671,8 @@ def printLidarBevSummary(
     )
 
     print()
-    print("Multi-channel BEV:")
-    print("------------------")
+    print("Geometric BEV:")
+    print("--------------")
 
     print(
         f"Tensor shape        : "
@@ -669,16 +701,73 @@ def printLidarBevSummary(
 
 
 # ==============================================================
-# Save one frame visualization
+# Print semantic BEV summary
 # ==============================================================
 
-def saveSensorFusionFigure(
+def printSemanticBevSummary(
+    semanticResult
+):
+    """
+    Print semantic-BEV diagnostics.
+    """
+
+    print()
+    print("Semantic BEV:")
+    print("-------------")
+
+    print(
+        f"Combined tensor shape: "
+        f"{semanticResult['semanticMultiChannelBev'].shape}"
+    )
+
+    print(
+        f"Semantic cells       : "
+        f"{semanticResult['semanticCellCount']}"
+    )
+
+    print(
+        f"Objects contributing : "
+        f"{semanticResult['objectsContributing']}"
+    )
+
+    for className, cellCount in semanticResult[
+        "classCellCounts"
+    ].items():
+
+        print(
+            f"{className.capitalize():<20}: "
+            f"{cellCount} cells"
+        )
+
+    for objectSummary in semanticResult[
+        "objectSummaries"
+    ]:
+
+        print(
+            f"Object "
+            f"{objectSummary['objectNumber']} "
+            f"({objectSummary['className']}): "
+            f"{objectSummary['occupiedSemanticPoints']} "
+            f"LiDAR points -> "
+            f"{objectSummary['semanticCellCount']} "
+            f"semantic cells"
+        )
+
+
+# ==============================================================
+# Save one semantic-BEV photo
+# ==============================================================
+
+def saveSemanticBevPhoto(
     figure,
     scene,
     sampleIndex
 ):
     """
-    Save the complete visualization for one processed sample.
+    Save one semantic-BEV figure.
+
+    The filename is different from the earlier sensor-fusion PNG,
+    so the previous visualization is not replaced.
     """
 
     outputDirectory.mkdir(
@@ -691,7 +780,7 @@ def saveSensorFusionFigure(
         / (
             f"{scene['name']}_"
             f"sample_{sampleIndex:04d}_"
-            f"sensor_fusion.png"
+            f"semantic_bev.png"
         )
     )
 
@@ -701,10 +790,333 @@ def saveSensorFusionFigure(
         bbox_inches="tight"
     )
 
+    print()
     print(
-        f"\nVisualization saved to:\n"
+        f"Semantic BEV photo saved to:\n"
         f"{outputPath}"
     )
+
+
+# ==============================================================
+# Convert Matplotlib figure to RGB frame
+# ==============================================================
+
+def figureToRgbFrame(
+    figure
+):
+    """
+    Render one Matplotlib figure and convert it to an RGB NumPy
+    image for FFmpeg.
+    """
+
+    # Force complete canvas rendering.
+    figure.canvas.draw()
+
+    # Matplotlib canvas:
+    #
+    # height x width x RGBA
+    rgbaFrame = np.asarray(
+        figure.canvas.buffer_rgba()
+    )
+
+    # FFmpeg is configured for RGB24.
+    #
+    # Therefore remove the alpha channel.
+    rgbFrame = rgbaFrame[
+        :,
+        :,
+        0:3
+    ]
+
+    # FFmpeg requires the image bytes to occupy contiguous memory.
+    rgbFrame = np.ascontiguousarray(
+        rgbFrame,
+        dtype=np.uint8
+    )
+
+    return rgbFrame
+
+
+# ==============================================================
+# Create protected semantic-BEV video writer
+# ==============================================================
+
+def createVideoWriter(
+    videoPath,
+    frameWidth,
+    frameHeight
+):
+    """
+    Start FFmpeg.
+
+    Existing video files are NEVER overwritten.
+    """
+
+    # ----------------------------------------------------------
+    # Python-level overwrite protection
+    # ----------------------------------------------------------
+
+    if videoPath.exists():
+        raise FileExistsError(
+            f"Video already exists and will not be overwritten:\n"
+            f"{videoPath}"
+        )
+
+    # ----------------------------------------------------------
+    # Locate FFmpeg
+    # ----------------------------------------------------------
+
+    ffmpegPath = shutil.which(
+        "ffmpeg"
+    )
+
+    if ffmpegPath is None:
+        raise FileNotFoundError(
+            "FFmpeg was not found in Windows PATH."
+        )
+
+    outputDirectory.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # ----------------------------------------------------------
+    # FFmpeg command
+    # ----------------------------------------------------------
+
+    ffmpegCommand = [
+        ffmpegPath,
+
+        # Never overwrite an existing file.
+        "-n",
+
+        # Only print FFmpeg errors.
+        "-loglevel",
+        "error",
+
+        # Python supplies raw frames.
+        "-f",
+        "rawvideo",
+
+        # Three bytes per pixel:
+        #
+        # R G B
+        "-pix_fmt",
+        "rgb24",
+
+        # Input frame dimensions.
+        "-s",
+        f"{frameWidth}x{frameHeight}",
+
+        # Input frame rate.
+        "-r",
+        str(
+            videoFps
+        ),
+
+        # Read from Python stdin.
+        "-i",
+        "-",
+
+        # No audio.
+        "-an",
+
+        # H.264 encoding.
+        "-c:v",
+        "libx264",
+
+        # Quality/speed balance.
+        "-preset",
+        "medium",
+
+        # Lower CRF means better quality.
+        "-crf",
+        "18",
+
+        # H.264 yuv420p requires even dimensions.
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+
+        # Widely supported MP4 pixel format.
+        "-pix_fmt",
+        "yuv420p",
+
+        # Put MP4 metadata near the beginning of the file.
+        "-movflags",
+        "+faststart",
+
+        str(
+            videoPath
+        )
+    ]
+
+    print()
+    print("=" * 70)
+    print("Starting semantic BEV video")
+    print("=" * 70)
+
+    print(
+        f"FFmpeg     : "
+        f"{ffmpegPath}"
+    )
+
+    print(
+        f"Output     : "
+        f"{videoPath}"
+    )
+
+    print(
+        f"Frame size : "
+        f"{frameWidth} x {frameHeight}"
+    )
+
+    print(
+        f"Frame rate : "
+        f"{videoFps:.1f} FPS"
+    )
+
+    print("=" * 70)
+
+    return subprocess.Popen(
+        ffmpegCommand,
+        stdin=subprocess.PIPE
+    )
+
+
+# ==============================================================
+# Write RGB frame to video
+# ==============================================================
+
+def writeRgbFrameToVideo(
+    videoProcess,
+    rgbFrame,
+    expectedFrameSize
+):
+    """
+    Write exactly one RGB frame to FFmpeg.
+
+    Every video frame must have identical height and width.
+    """
+
+    (
+        frameHeight,
+        frameWidth,
+        frameChannels
+    ) = rgbFrame.shape
+
+    if frameChannels != 3:
+        raise ValueError(
+            f"Expected 3 RGB channels, "
+            f"received {frameChannels}."
+        )
+
+    currentFrameSize = (
+        frameHeight,
+        frameWidth
+    )
+
+    if currentFrameSize != expectedFrameSize:
+        raise ValueError(
+            f"Video frame size changed from "
+            f"{expectedFrameSize} to "
+            f"{currentFrameSize}."
+        )
+
+    if videoProcess.stdin is None:
+        raise RuntimeError(
+            "FFmpeg input pipe is unavailable."
+        )
+
+    videoProcess.stdin.write(
+        rgbFrame.tobytes()
+    )
+
+
+# ==============================================================
+# Finalize video
+# ==============================================================
+
+def closeVideoWriter(
+    videoProcess,
+    videoPath
+):
+    """
+    Close FFmpeg stdin and finalize the MP4 container.
+    """
+
+    if videoProcess is None:
+        return
+
+    if videoProcess.stdin is not None:
+        videoProcess.stdin.close()
+
+    returnCode = videoProcess.wait()
+
+    if returnCode != 0:
+        raise RuntimeError(
+            f"FFmpeg exited with code {returnCode}."
+        )
+
+    print()
+    print("=" * 70)
+
+    print(
+        f"Semantic BEV video saved to:\n"
+        f"{videoPath}"
+    )
+
+    print("=" * 70)
+
+
+# ==============================================================
+# Decide which dataset samples to process
+# ==============================================================
+
+def getSelectedScenes(
+    loader
+):
+    """
+    Resolve dataset selection from the ONE outputMode flag.
+
+    photo:
+        first scene only
+
+    video:
+        every scene
+    """
+
+    if outputMode == "photo":
+
+        return [
+            loader.nusc.scene[
+                0
+            ]
+        ]
+
+    # outputMode == "video"
+    return loader.nusc.scene
+
+
+def shouldStopProcessing(
+    processedSampleCount
+):
+    """
+    Resolve sample count from the ONE outputMode flag.
+
+    photo:
+        stop after one sample
+
+    video:
+        never stop early
+    """
+
+    if outputMode == "photo":
+        return (
+            processedSampleCount
+            >= 1
+        )
+
+    return False
 
 
 # ==============================================================
@@ -713,23 +1125,58 @@ def saveSensorFusionFigure(
 
 def main():
     """
-    Run the NavFusion processing pipeline.
+    Run the NavFusion semantic-BEV pipeline.
 
-    This runner controls:
+    The ONE outputMode flag controls the complete execution mode.
 
-        dataset loading,
-        scene selection,
-        sample selection,
-        camera selection,
-        LiDAR selection,
-        sensor-file loading,
-        calibration loading,
-        car-pose loading,
-        YOLO model loading,
-        processing order.
+    outputMode = "photo"
 
-    Processing modules receive already-selected frameData.
+        first scene
+            ↓
+        first sample
+            ↓
+        sensor fusion
+            ↓
+        geometric BEV
+            ↓
+        semantic BEV
+            ↓
+        save PNG
+            ↓
+        display figure
+
+    outputMode = "video"
+
+        all scenes
+            ↓
+        all samples
+            ↓
+        sensor fusion
+            ↓
+        geometric BEV
+            ↓
+        semantic BEV
+            ↓
+        stream each figure into FFmpeg
+            ↓
+        save protected MP4
     """
+
+    # ----------------------------------------------------------
+    # Validate the only output-mode flag
+    # ----------------------------------------------------------
+
+    validateOutputMode()
+
+    print()
+    print("=" * 70)
+
+    print(
+        f"NavFusion output mode: "
+        f"{outputMode}"
+    )
+
+    print("=" * 70)
 
     # ----------------------------------------------------------
     # Load nuScenes once
@@ -754,186 +1201,289 @@ def main():
     )
 
     # ----------------------------------------------------------
-    # Decide which scenes enter the pipeline
+    # Resolve scenes using outputMode
     # ----------------------------------------------------------
 
-    if sceneIndex is None:
+    selectedScenes = getSelectedScenes(
+        loader
+    )
 
-        # None means every scene in the dataset.
-        selectedScenes = (
-            loader.nusc.scene
-        )
+    # ----------------------------------------------------------
+    # Global processed-sample counter
+    # ----------------------------------------------------------
 
-    else:
-
-        if (
-            sceneIndex < 0
-            or sceneIndex >= len(
-                loader.nusc.scene
-            )
-        ):
-            raise IndexError(
-                f"sceneIndex={sceneIndex} is invalid. "
-                f"The dataset contains "
-                f"{len(loader.nusc.scene)} scenes."
-            )
-
-        selectedScenes = [
-            loader.nusc.scene[
-                sceneIndex
-            ]
-        ]
-
-    # Global count across all selected scenes.
     processedSampleCount = 0
 
     # ----------------------------------------------------------
-    # Loop through selected scenes
+    # Video state
     # ----------------------------------------------------------
 
-    for scene in selectedScenes:
+    videoPath = (
+        outputDirectory
+        / semanticVideoFileName
+    )
 
-        print()
-        print("=" * 70)
+    videoProcess = None
 
-        print(
-            f"Processing scene: "
-            f"{scene['name']}"
-        )
+    videoFrameSize = None
 
-        print("=" * 70)
+    # ----------------------------------------------------------
+    # Process selected data
+    # ----------------------------------------------------------
 
-        sampleToken = scene[
-            "first_sample_token"
-        ]
+    try:
 
-        sampleIndex = 0
+        for scene in selectedScenes:
 
-        # ------------------------------------------------------
-        # Loop through every sample in the current scene
-        # ------------------------------------------------------
+            print()
+            print("=" * 70)
 
-        while sampleToken:
-
-            # maxSamples is only a development/testing limit.
-            #
-            # None means no early stopping.
-            if (
-                maxSamples is not None
-                and processedSampleCount >= maxSamples
-            ):
-                break
-
-            # --------------------------------------------------
-            # Select exactly one sample
-            # --------------------------------------------------
-
-            sample = loader.nusc.get(
-                "sample",
-                sampleToken
+            print(
+                f"Processing scene: "
+                f"{scene['name']}"
             )
 
-            # --------------------------------------------------
-            # Load exact data for this sample
-            # --------------------------------------------------
+            print("=" * 70)
 
-            frameData = loadFrameData(
-                loader,
-                sample
-            )
+            sampleToken = scene[
+                "first_sample_token"
+            ]
 
-            # --------------------------------------------------
-            # Camera + LiDAR + YOLO fusion
-            # --------------------------------------------------
-
-            sensorResult = processSensorFusion(
-                frameData,
-                yoloModel,
-                sensorFusionConfig
-            )
+            sampleIndex = 0
 
             # --------------------------------------------------
-            # LiDAR + RANSAC + self-return filtering
+            # Loop through scene samples
             # --------------------------------------------------
 
-            # Both algorithms receive the same frameData.
-            bevResult = processLidarBev(
-                frameData,
-                bevConfig
-            )
+            while sampleToken:
 
-            # --------------------------------------------------
-            # Print diagnostics
-            # --------------------------------------------------
+                # In photo mode:
+                #
+                # stop after the first global sample.
+                #
+                # In video mode:
+                #
+                # this remains False for the complete dataset.
+                if shouldStopProcessing(
+                    processedSampleCount
+                ):
+                    break
 
-            printSensorFusionSummary(
-                scene,
-                sampleIndex,
-                sensorResult
-            )
+                # ------------------------------------------------
+                # Fetch one sample
+                # ------------------------------------------------
 
-            printLidarBevSummary(
-                bevResult
-            )
-
-            # --------------------------------------------------
-            # Create combined visualization
-            # --------------------------------------------------
-
-            figure = createSensorFusionFigure(
-                sensorResult,
-                bevResult,
-                visualizationRangeM
-            )
-
-            # --------------------------------------------------
-            # Save visualization
-            # --------------------------------------------------
-
-            if saveImages:
-
-                saveSensorFusionFigure(
-                    figure,
-                    scene,
-                    sampleIndex
+                sample = loader.nusc.get(
+                    "sample",
+                    sampleToken
                 )
 
-            # --------------------------------------------------
-            # Display or close visualization
-            # --------------------------------------------------
+                # ------------------------------------------------
+                # Load synchronized source data
+                # ------------------------------------------------
 
-            if showFigure:
+                frameData = loadFrameData(
+                    loader,
+                    sample
+                )
 
-                plt.show()
+                # ------------------------------------------------
+                # Camera + YOLO + LiDAR association
+                # ------------------------------------------------
 
-            else:
+                sensorResult = processSensorFusion(
+                    frameData,
+                    yoloModel,
+                    sensorFusionConfig
+                )
+
+                # ------------------------------------------------
+                # 4-channel geometric car-frame LiDAR BEV
+                # ------------------------------------------------
+                #
+                # D = density
+                # H = maximum obstacle height
+                # I = mean intensity
+                # O = occupancy
+                bevResult = processLidarBev(
+                    frameData,
+                    bevConfig
+                )
+
+                # ------------------------------------------------
+                # Semantic BEV
+                # ------------------------------------------------
+                #
+                # Adds:
+                #
+                # S = semantic vehicle class
+                #
+                # producing:
+                #
+                # [D, H, I, O, S]
+                semanticResult = createSemanticBev(
+                    sensorResult,
+                    bevResult,
+                    bevConfig
+                )
+
+                # ------------------------------------------------
+                # Console diagnostics
+                # ------------------------------------------------
+
+                printSensorFusionSummary(
+                    scene,
+                    sampleIndex,
+                    sensorResult
+                )
+
+                printLidarBevSummary(
+                    bevResult
+                )
+
+                printSemanticBevSummary(
+                    semanticResult
+                )
+
+                # ------------------------------------------------
+                # Create complete 3 x 3 visualization
+                # ------------------------------------------------
+
+                figure = createSensorFusionFigure(
+                    sensorResult,
+                    bevResult,
+                    semanticResult,
+                    visualizationRangeM
+                )
+
+                figure.suptitle(
+                    (
+                        f"NavFusion Semantic BEV | "
+                        f"{scene['name']} | "
+                        f"Sample {sampleIndex:04d}"
+                    ),
+                    fontsize=16,
+                    y=0.995
+                )
+
+                # ------------------------------------------------
+                # PHOTO MODE
+                # ------------------------------------------------
+
+                if outputMode == "photo":
+
+                    saveSemanticBevPhoto(
+                        figure,
+                        scene,
+                        sampleIndex
+                    )
+
+                    # Only photo mode opens the interactive window.
+                    plt.show()
+
+                # ------------------------------------------------
+                # VIDEO MODE
+                # ------------------------------------------------
+
+                else:
+
+                    rgbFrame = figureToRgbFrame(
+                        figure
+                    )
+
+                    (
+                        frameHeight,
+                        frameWidth,
+                        _
+                    ) = rgbFrame.shape
+
+                    currentFrameSize = (
+                        frameHeight,
+                        frameWidth
+                    )
+
+                    # Start FFmpeg only after the first figure has
+                    # been rendered because that determines the
+                    # exact video dimensions.
+                    if videoProcess is None:
+
+                        videoFrameSize = (
+                            currentFrameSize
+                        )
+
+                        videoProcess = createVideoWriter(
+                            videoPath,
+                            frameWidth,
+                            frameHeight
+                        )
+
+                    if videoFrameSize is None:
+                        raise RuntimeError(
+                            "Video frame size was not initialized."
+                        )
+
+                    writeRgbFrameToVideo(
+                        videoProcess,
+                        rgbFrame,
+                        videoFrameSize
+                    )
+
+                    print(
+                        f"Semantic video frame written: "
+                        f"{processedSampleCount + 1}"
+                    )
+
+                # ------------------------------------------------
+                # Release Matplotlib memory
+                # ------------------------------------------------
 
                 plt.close(
                     figure
                 )
 
+                # ------------------------------------------------
+                # Move to next nuScenes sample
+                # ------------------------------------------------
+
+                sampleToken = sample[
+                    "next"
+                ]
+
+                sampleIndex += 1
+
+                processedSampleCount += 1
+
             # --------------------------------------------------
-            # Move to next sample
+            # Photo mode needs only the first sample
             # --------------------------------------------------
 
-            sampleToken = sample[
-                "next"
-            ]
+            if shouldStopProcessing(
+                processedSampleCount
+            ):
+                break
 
-            sampleIndex += 1
+    finally:
 
-            processedSampleCount += 1
-
-        # maxSamples is global, so break out of the scene loop too
-        # when the requested development limit has been reached.
+        # ------------------------------------------------------
+        # Finalize video
+        # ------------------------------------------------------
+        #
+        # Photo mode never starts videoProcess.
+        #
+        # Video mode closes FFmpeg cleanly even if processing
+        # raises an exception after some frames have been written.
         if (
-            maxSamples is not None
-            and processedSampleCount >= maxSamples
+            outputMode == "video"
+            and videoProcess is not None
         ):
-            break
+
+            closeVideoWriter(
+                videoProcess,
+                videoPath
+            )
 
     # ----------------------------------------------------------
-    # Final run summary
+    # Final summary
     # ----------------------------------------------------------
 
     print()
@@ -945,6 +1495,15 @@ def main():
     )
 
     print("=" * 70)
+
+    if outputMode == "video":
+
+        print(
+            f"Semantic BEV video:\n"
+            f"{videoPath}"
+        )
+
+        print("=" * 70)
 
 
 if __name__ == "__main__":

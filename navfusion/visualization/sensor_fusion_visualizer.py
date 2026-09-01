@@ -1,4 +1,179 @@
 import matplotlib.pyplot as plt
+import numpy as np
+
+from matplotlib.colors import BoundaryNorm
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
+
+
+def drawCameraImage(
+    axis,
+    sensorResult
+):
+    """
+    Draw the original CAM_FRONT image.
+    """
+
+    axis.imshow(
+        sensorResult[
+            "cameraImage"
+        ]
+    )
+
+    axis.set_title(
+        "CAM_FRONT"
+    )
+
+    axis.axis(
+        "off"
+    )
+
+
+def drawRawLidar(
+    axis,
+    sensorResult,
+    visualizationRangeM
+):
+    """
+    Draw raw LIDAR_TOP sensor-frame points.
+
+    +x = forward
+    +y = left
+    """
+
+    lidarPoints = sensorResult[
+        "lidarPointCloud"
+    ].points
+
+    x = lidarPoints[
+        0,
+        :
+    ]
+
+    y = lidarPoints[
+        1,
+        :
+    ]
+
+    rangeMask = (
+        (x >= -visualizationRangeM)
+        & (x <= visualizationRangeM)
+        & (y >= -visualizationRangeM)
+        & (y <= visualizationRangeM)
+    )
+
+    # Horizontal axis = LiDAR y.
+    # Vertical axis   = LiDAR x.
+    axis.scatter(
+        y[
+            rangeMask
+        ],
+        x[
+            rangeMask
+        ],
+        s=1
+    )
+
+    axis.scatter(
+        0.0,
+        0.0,
+        marker="^",
+        s=80,
+        label="LIDAR_TOP"
+    )
+
+    # +y means left.
+    #
+    # Inverting the horizontal axis makes physical left appear
+    # visually on the left side of the plot.
+    axis.set_xlim(
+        visualizationRangeM,
+        -visualizationRangeM
+    )
+
+    axis.set_ylim(
+        -visualizationRangeM,
+        visualizationRangeM
+    )
+
+    axis.set_aspect(
+        "equal"
+    )
+
+    axis.set_xlabel(
+        "LiDAR y (m, +left)"
+    )
+
+    axis.set_ylabel(
+        "LiDAR x (m, +forward)"
+    )
+
+    axis.set_title(
+        "LIDAR_TOP - Raw Sensor-Frame XY"
+    )
+
+    axis.grid(
+        True,
+        alpha=0.25
+    )
+
+    axis.legend(
+        loc="upper right"
+    )
+
+
+def drawProjectedLidar(
+    axis,
+    sensorResult
+):
+    """
+    Draw every camera-visible projected LiDAR return.
+    """
+
+    cameraImage = sensorResult[
+        "cameraImage"
+    ]
+
+    points2d = sensorResult[
+        "points2d"
+    ]
+
+    depths = sensorResult[
+        "depths"
+    ]
+
+    fusionMask = sensorResult[
+        "fusionMask"
+    ]
+
+    axis.imshow(
+        cameraImage
+    )
+
+    axis.scatter(
+        points2d[
+            0,
+            fusionMask
+        ],
+        points2d[
+            1,
+            fusionMask
+        ],
+        c=depths[
+            fusionMask
+        ],
+        s=3,
+        cmap="viridis",
+        alpha=0.80
+    )
+
+    axis.set_title(
+        "CAM_FRONT + Projected LiDAR"
+    )
+
+    axis.axis(
+        "off"
+    )
 
 
 def drawVehicleFusion(
@@ -6,8 +181,8 @@ def drawVehicleFusion(
     sensorResult
 ):
     """
-    Draw YOLO bounding boxes and only the LiDAR points associated
-    with each detected vehicle.
+    Draw YOLO vehicle boxes and the LiDAR returns associated with
+    each fused vehicle.
     """
 
     cameraImage = sensorResult[
@@ -30,10 +205,6 @@ def drawVehicleFusion(
         cameraImage
     )
 
-    # Do not draw every camera-visible LiDAR point in this panel.
-    #
-    # Only LiDAR points associated with a detected object are
-    # displayed.
     for fusedObject in fusedObjects:
 
         x1, y1, x2, y2 = fusedObject[
@@ -41,16 +212,20 @@ def drawVehicleFusion(
         ]
 
         width = (
-            x2 - x1
+            x2
+            - x1
         )
 
         height = (
-            y2 - y1
+            y2
+            - y1
         )
 
-        # Draw the YOLO bounding box.
         rectangle = plt.Rectangle(
-            (x1, y1),
+            (
+                x1,
+                y1
+            ),
             width,
             height,
             fill=False,
@@ -61,19 +236,10 @@ def drawVehicleFusion(
             rectangle
         )
 
-        # cleanIndices contains LiDAR points that:
-        #
-        # 1. project inside the camera image,
-        # 2. project inside the shrunk YOLO bounding box,
-        # 3. remain after MAD depth-outlier filtering.
         cleanIndices = fusedObject[
             "cleanIndices"
         ]
 
-        # Draw only LiDAR points associated with this object.
-        #
-        # alpha = 0.80 means 80% opaque,
-        # therefore 20% transparent.
         axis.scatter(
             points2d[
                 0,
@@ -86,29 +252,20 @@ def drawVehicleFusion(
             c=depths[
                 cleanIndices
             ],
-            s=12,
-            cmap="viridis",
-            alpha=0.80
+            s=8,
+            cmap="plasma"
         )
 
-        # Example:
-        #
-        # truck 0.80
-        # 10.07 m
-        #
-        # truck = YOLO predicted class
-        # 0.80  = YOLO confidence
-        # 10.07 = median filtered LiDAR/camera depth
         label = (
             f"{fusedObject['className']} "
             f"{fusedObject['confidence']:.2f}\n"
-            f"{fusedObject['distanceM']:.2f} m"
+            f"{fusedObject['distanceM']:.1f} m"
         )
 
         axis.text(
             x1,
             max(
-                15,
+                0,
                 y1 - 8
             ),
             label,
@@ -121,7 +278,7 @@ def drawVehicleFusion(
         )
 
     axis.set_title(
-        "YOLO11 + LiDAR Vehicle Distance"
+        "YOLO + Object-Associated LiDAR"
     )
 
     axis.axis(
@@ -129,374 +286,485 @@ def drawVehicleFusion(
     )
 
 
-def drawLidarBev(
+def drawCarMarker(
     axis,
-    bevGrid,
-    carRow,
-    carColumn,
-    title,
-    colorbarLabel=None
+    bevResult
 ):
     """
-    Draw one BEV channel.
-
-    bevGrid may contain:
-
-        density,
-        maximum height,
-        mean intensity,
-        occupancy.
-
-    All channels use the same BEV row/column coordinate system.
+    Draw the true car-frame origin on a BEV.
     """
 
-    bevImage = axis.imshow(
-        bevGrid,
-        origin="upper"
-    )
-
-    # Mark the car/LiDAR origin.
     axis.scatter(
-        carColumn,
-        carRow,
-        marker="x",
+        bevResult[
+            "carColumn"
+        ],
+        bevResult[
+            "carRow"
+        ],
+        marker="^",
         s=80,
         label="Car"
     )
 
+
+def drawLidarBev(
+    axis,
+    bevGrid,
+    bevResult,
+    title,
+    cmap="viridis",
+    colorbarLabel=None
+):
+    """
+    Draw one car-frame LiDAR BEV channel.
+    """
+
+    image = axis.imshow(
+        bevGrid,
+        origin="upper",
+        cmap=cmap,
+        interpolation="nearest"
+    )
+
+    drawCarMarker(
+        axis,
+        bevResult
+    )
+
     axis.set_title(
-        title
+        title,
+        pad=10
     )
 
     axis.set_xlabel(
-        "BEV column"
+        "BEV column (+y left)"
     )
 
     axis.set_ylabel(
-        "BEV row"
+        "BEV row (+x forward)"
     )
 
-    axis.legend()
+    axis.legend(
+        loc="lower right"
+    )
 
-    # Height and intensity have meaningful physical/numerical
-    # values, so display their scales alongside the image.
     if colorbarLabel is not None:
 
-        axis.figure.colorbar(
-            bevImage,
+        colorbar = axis.figure.colorbar(
+            image,
             ax=axis,
-            label=colorbarLabel
+            fraction=0.046,
+            pad=0.04
         )
+
+        colorbar.set_label(
+            colorbarLabel
+        )
+
+
+def drawSemanticBev(
+    axis,
+    semanticResult,
+    bevResult
+):
+    """
+    Draw the semantic BEV.
+
+    Semantic classes come from YOLO.
+
+    Their physical locations come from the associated car-frame
+    LiDAR points.
+
+    Display:
+
+        black       = no obstacle
+        dark gray   = LiDAR obstacle without semantic label
+        blue        = car
+        orange      = truck
+        green       = bus
+        red         = motorcycle
+    """
+
+    semanticGrid = semanticResult[
+        "semanticGrid"
+    ]
+
+    occupancyGrid = bevResult[
+        "occupancyGrid"
+    ]
+
+    # ----------------------------------------------------------
+    # Start with background
+    # ----------------------------------------------------------
+
+    semanticDisplayGrid = np.zeros(
+        semanticGrid.shape,
+        dtype=np.int16
+    )
+
+    # ----------------------------------------------------------
+    # Show occupied but semantically unlabeled cells
+    # ----------------------------------------------------------
+
+    # Display value 5 means:
+    #
+    # LiDAR detects a physical obstacle,
+    # but CAM_FRONT + YOLO has not assigned a vehicle class.
+    unlabeledObstacleMask = (
+        (occupancyGrid > 0)
+        & (semanticGrid == 0)
+    )
+
+    semanticDisplayGrid[
+        unlabeledObstacleMask
+    ] = 5
+
+    # ----------------------------------------------------------
+    # Copy semantic classes
+    # ----------------------------------------------------------
+
+    semanticMask = (
+        semanticGrid > 0
+    )
+
+    semanticDisplayGrid[
+        semanticMask
+    ] = semanticGrid[
+        semanticMask
+    ]
+
+    # ----------------------------------------------------------
+    # Visualization colors
+    # ----------------------------------------------------------
+
+    semanticCmap = ListedColormap(
+        [
+            "black",       # 0 background
+            "tab:blue",    # 1 car
+            "tab:orange",  # 2 truck
+            "tab:green",   # 3 bus
+            "tab:red",     # 4 motorcycle
+            "dimgray"      # 5 unlabeled obstacle
+        ]
+    )
+
+    semanticNorm = BoundaryNorm(
+        [
+            -0.5,
+            0.5,
+            1.5,
+            2.5,
+            3.5,
+            4.5,
+            5.5
+        ],
+        semanticCmap.N
+    )
+
+    axis.imshow(
+        semanticDisplayGrid,
+        origin="upper",
+        cmap=semanticCmap,
+        norm=semanticNorm,
+        interpolation="nearest"
+    )
+
+    # ----------------------------------------------------------
+    # Make actual semantic cells clearly visible
+    # ----------------------------------------------------------
+
+    semanticRows, semanticColumns = np.nonzero(
+        semanticGrid > 0
+    )
+
+    if semanticRows.size > 0:
+
+        semanticValues = semanticGrid[
+            semanticRows,
+            semanticColumns
+        ]
+
+        axis.scatter(
+            semanticColumns,
+            semanticRows,
+            c=semanticValues,
+            cmap=semanticCmap,
+            norm=semanticNorm,
+            marker="s",
+            s=20,
+            linewidths=0
+        )
+
+    # ----------------------------------------------------------
+    # Draw car-frame origin
+    # ----------------------------------------------------------
+
+    drawCarMarker(
+        axis,
+        bevResult
+    )
+
+    # ----------------------------------------------------------
+    # Label semantic objects
+    # ----------------------------------------------------------
+
+    for objectSummary in semanticResult[
+        "objectSummaries"
+    ]:
+
+        centerRow = objectSummary[
+            "centerRow"
+        ]
+
+        centerColumn = objectSummary[
+            "centerColumn"
+        ]
+
+        if (
+            centerRow is None
+            or centerColumn is None
+        ):
+            continue
+
+        axis.text(
+            centerColumn,
+            centerRow,
+            objectSummary[
+                "className"
+            ].upper(),
+            fontsize=8,
+            ha="center",
+            va="center",
+            bbox={
+                "facecolor": "white",
+                "alpha": 0.85,
+                "edgecolor": "black"
+            }
+        )
+
+    # ----------------------------------------------------------
+    # Semantic class legend
+    # ----------------------------------------------------------
+
+    legendHandles = [
+        Patch(
+            facecolor="tab:blue",
+            label="Car"
+        ),
+
+        Patch(
+            facecolor="tab:orange",
+            label="Truck"
+        ),
+
+        Patch(
+            facecolor="tab:green",
+            label="Bus"
+        ),
+
+        Patch(
+            facecolor="tab:red",
+            label="Motorcycle"
+        ),
+
+        Patch(
+            facecolor="dimgray",
+            label="Unlabeled LiDAR obstacle"
+        )
+    ]
+
+    # Place the legend outside the BEV so it does not hide cells.
+    axis.legend(
+        handles=legendHandles,
+        loc="upper left",
+        bbox_to_anchor=(
+            1.02,
+            1.0
+        ),
+        fontsize=7,
+        borderaxespad=0
+    )
+
+    axis.set_title(
+        "Semantic BEV - Vehicle Classes",
+        pad=10
+    )
+
+    axis.set_xlabel(
+        "BEV column (+y left)"
+    )
+
+    axis.set_ylabel(
+        "BEV row (+x forward)"
+    )
 
 
 def createSensorFusionFigure(
     sensorResult,
     bevResult,
+    semanticResult,
     visualizationRangeM
 ):
     """
-    Create the eight-panel NavFusion diagnostic visualization.
+    Create the complete NavFusion semantic-BEV visualization.
 
-    Top row:
+    Layout:
 
-        1. Raw camera
-        2. Raw LiDAR XY
-        3. LiDAR projected onto camera
-        4. YOLO + object-specific LiDAR
+        Row 1:
+            Camera
+            Raw LiDAR
+            Projected LiDAR
 
-    Bottom row:
+        Row 2:
+            YOLO + associated LiDAR
+            Density BEV
+            Maximum-height BEV
 
-        5. Clean obstacle density
-        6. Maximum obstacle height above ground
-        7. Mean LiDAR intensity
-        8. Binary occupancy
-
-    The four bottom-row BEV channels are spatially aligned.
+        Row 3:
+            Mean-intensity BEV
+            Occupancy BEV
+            Semantic BEV
     """
 
-    cameraImage = sensorResult[
-        "cameraImage"
-    ]
-
-    lidarPointCloud = sensorResult[
-        "lidarPointCloud"
-    ]
-
-    points2d = sensorResult[
-        "points2d"
-    ]
-
-    depths = sensorResult[
-        "depths"
-    ]
-
-    fusionMask = sensorResult[
-        "fusionMask"
-    ]
-
-    points = lidarPointCloud.points
-
-    x = points[
-        0,
-        :
-    ]
-
-    y = points[
-        1,
-        :
-    ]
-
-    # Keep only the requested physical range for the raw XY
-    # visualization.
-    rangeMask = (
-        (x > -visualizationRangeM)
-        & (x < visualizationRangeM)
-        & (y > -visualizationRangeM)
-        & (y < visualizationRangeM)
-    )
-
-    xVisible = x[
-        rangeMask
-    ]
-
-    yVisible = y[
-        rangeMask
-    ]
-
-    # 2 rows x 4 columns = 8 diagnostic panels.
     figure, axes = plt.subplots(
-        2,
-        4,
-        figsize=(28, 14)
-    )
-
-    # Convert:
-    #
-    # axes[0, 0], axes[0, 1], ...
-    #
-    # into:
-    #
-    # axes[0], axes[1], ... axes[7]
-    axes = axes.flatten()
-
-    # ----------------------------------------------------------
-    # Panel 1: Camera
-    # ----------------------------------------------------------
-
-    axes[0].imshow(
-        cameraImage
-    )
-
-    axes[0].set_title(
-        sensorResult[
-            "cameraChannel"
-        ]
-    )
-
-    axes[0].axis(
-        "off"
-    )
-
-    # ----------------------------------------------------------
-    # Panel 2: Raw LiDAR
-    # ----------------------------------------------------------
-
-    axes[1].scatter(
-        yVisible,
-        xVisible,
-        s=0.5
-    )
-
-    axes[1].scatter(
-        0,
-        0,
-        marker="x",
-        s=80,
-        label="LiDAR sensor"
-    )
-
-    axes[1].set_title(
-        (
-            f"{sensorResult['lidarChannel']} "
-            f"- Raw Sensor-Frame XY"
+        3,
+        3,
+        figsize=(
+            24,
+            18
         )
     )
 
-    axes[1].set_xlabel(
-        "y - left/right (m)"
-    )
-
-    axes[1].set_ylabel(
-        "x - forward/backward (m)"
-    )
-
-    axes[1].set_xlim(
-        -visualizationRangeM,
-        visualizationRangeM
-    )
-
-    axes[1].set_ylim(
-        -visualizationRangeM,
-        visualizationRangeM
-    )
-
-    axes[1].set_aspect(
-        "equal"
-    )
-
-    axes[1].grid(
-        True
-    )
-
-    axes[1].legend()
-
     # ----------------------------------------------------------
-    # Panel 3: Camera + all projected LiDAR
+    # Row 1
     # ----------------------------------------------------------
 
-    axes[2].imshow(
-        cameraImage
-    )
-
-    fusionScatter = axes[2].scatter(
-        points2d[
+    drawCameraImage(
+        axes[
             0,
-            fusionMask
+            0
         ],
-        points2d[
-            1,
-            fusionMask
+        sensorResult
+    )
+
+    drawRawLidar(
+        axes[
+            0,
+            1
         ],
-        c=depths[
-            fusionMask
+        sensorResult,
+        visualizationRangeM
+    )
+
+    drawProjectedLidar(
+        axes[
+            0,
+            2
         ],
-        s=6,
-        cmap="viridis",
-
-        # 80% opaque = 20% transparent.
-        alpha=0.80
-    )
-
-    axes[2].set_title(
-        (
-            f"{sensorResult['cameraChannel']} + "
-            f"{sensorResult['lidarChannel']} Fusion"
-        )
-    )
-
-    axes[2].axis(
-        "off"
-    )
-
-    figure.colorbar(
-        fusionScatter,
-        ax=axes[2],
-        label="Depth (m)"
-    )
-
-    # ----------------------------------------------------------
-    # Panel 4: YOLO + object-specific LiDAR
-    # ----------------------------------------------------------
-
-    drawVehicleFusion(
-        axes[3],
         sensorResult
     )
 
     # ----------------------------------------------------------
-    # Panel 5: Clean obstacle density
+    # Row 2
     # ----------------------------------------------------------
 
-    # obstacleDisplayDensity contains the RANSAC-ground-filtered
-    # and self-return-filtered LiDAR obstacle density.
-    #
-    # It has already been log-scaled and normalized for display.
+    drawVehicleFusion(
+        axes[
+            1,
+            0
+        ],
+        sensorResult
+    )
+
     drawLidarBev(
-        axes[4],
+        axes[
+            1,
+            1
+        ],
         bevResult[
             "obstacleDisplayDensity"
         ],
-        bevResult[
-            "carRow"
-        ],
-        bevResult[
-            "carColumn"
-        ],
-        "LiDAR BEV - Density"
+        bevResult,
+        "Car-Frame LiDAR BEV - Density",
+        cmap="viridis"
     )
 
-    # ----------------------------------------------------------
-    # Panel 6: Maximum height above ground
-    # ----------------------------------------------------------
-
-    # For every occupied cell:
-    #
-    # maxHeightGrid[row, column]
-    #
-    # stores the highest clean obstacle return above the
-    # RANSAC-estimated ground plane.
     drawLidarBev(
-        axes[5],
+        axes[
+            1,
+            2
+        ],
         bevResult[
             "maxHeightGrid"
         ],
-        bevResult[
-            "carRow"
-        ],
-        bevResult[
-            "carColumn"
-        ],
-        "LiDAR BEV - Maximum Height",
+        bevResult,
+        "Car-Frame LiDAR BEV - Maximum Height",
+        cmap="viridis",
         colorbarLabel="Height above ground (m)"
     )
 
     # ----------------------------------------------------------
-    # Panel 7: Mean LiDAR intensity
+    # Row 3
     # ----------------------------------------------------------
 
-    # For every occupied cell:
-    #
-    # meanIntensityGrid[row, column]
-    #
-    # contains the average reflectivity/intensity of the clean
-    # obstacle LiDAR returns in that cell.
     drawLidarBev(
-        axes[6],
+        axes[
+            2,
+            0
+        ],
         bevResult[
             "meanIntensityGrid"
         ],
-        bevResult[
-            "carRow"
-        ],
-        bevResult[
-            "carColumn"
-        ],
-        "LiDAR BEV - Mean Intensity",
-        colorbarLabel="Mean LiDAR intensity"
+        bevResult,
+        "Car-Frame LiDAR BEV - Mean Intensity",
+        cmap="viridis",
+        colorbarLabel="Mean intensity"
     )
 
-    # ----------------------------------------------------------
-    # Panel 8: Binary occupancy
-    # ----------------------------------------------------------
-
-    # occupancyGrid contains:
-    #
-    # 0 = no clean obstacle return in this cell
-    # 1 = at least one clean obstacle return
     drawLidarBev(
-        axes[7],
+        axes[
+            2,
+            1
+        ],
         bevResult[
             "occupancyGrid"
         ],
-        bevResult[
-            "carRow"
-        ],
-        bevResult[
-            "carColumn"
-        ],
-        "LiDAR BEV - Occupancy"
+        bevResult,
+        "Car-Frame LiDAR BEV - Occupancy",
+        cmap="gray"
     )
 
-    figure.tight_layout()
+    # ----------------------------------------------------------
+    # Actual semantic BEV panel
+    # ----------------------------------------------------------
+
+    drawSemanticBev(
+        axes[
+            2,
+            2
+        ],
+        semanticResult,
+        bevResult
+    )
+
+    # ----------------------------------------------------------
+    # Figure spacing
+    # ----------------------------------------------------------
+    #
+    # Right margin:
+    #     reserved for semantic legend.
+    #
+    # Top margin:
+    #     reserved for figure.suptitle() from run_navfusion.py.
+    figure.tight_layout(
+        rect=(
+            0.0,
+            0.0,
+            0.94,
+            0.95
+        ),
+        h_pad=3.0,
+        w_pad=3.0
+    )
 
     return figure
