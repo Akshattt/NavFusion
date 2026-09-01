@@ -1,40 +1,249 @@
 import numpy as np
+from pyquaternion import Quaternion
 
 
-def filterPointsToBev(
+def transformLidarToCar(
     lidarPointCloud,
-    bevConfig
+    lidarCalibration
 ):
     """
-    Keep LiDAR points inside the configured metric BEV region.
+    Transform the complete LIDAR_TOP point cloud from the LiDAR
+    sensor coordinate frame into the car coordinate frame.
 
-    LiDAR sensor coordinates:
+    nuScenes calibrated_sensor provides:
 
-        +x = forward
-        +y = left
-        +z = up
+        rotation
+            sensor -> car rotation
+
+        translation
+            sensor origin expressed in the car frame
+
+    For every LiDAR point:
+
+        pCar = R * pLidar + t
+
+    where:
+
+        pLidar shape = (3, N)
+        R shape      = (3, 3)
+        t shape      = (3, 1)
+        pCar shape   = (3, N)
+
+    The original LiDAR point cloud is not modified.
     """
 
     points = lidarPointCloud.points
 
-    x = points[0, :]
-    y = points[1, :]
-    z = points[2, :]
-    intensity = points[3, :]
+    # Original xyz coordinates in the LIDAR_TOP sensor frame.
+    lidarPoints = points[
+        0:3,
+        :
+    ]
 
+    # The fourth LiDAR row contains intensity.
+    intensity = points[
+        3,
+        :
+    ]
+
+    # nuScenes stores rotation as a quaternion:
+    #
+    # [w, x, y, z]
+    #
+    # Quaternion(...).rotation_matrix converts it into a
+    # 3 x 3 rotation matrix.
+    rotationMatrix = Quaternion(
+        lidarCalibration[
+            "rotation"
+        ]
+    ).rotation_matrix
+
+    # Convert:
+    #
+    # [tx, ty, tz]
+    #
+    # into:
+    #
+    # [[tx],
+    #  [ty],
+    #  [tz]]
+    #
+    # The (3, 1) shape lets NumPy add the same translation to
+    # every one of the N LiDAR points.
+    translationVector = np.array(
+        lidarCalibration[
+            "translation"
+        ],
+        dtype=np.float64
+    ).reshape(
+        3,
+        1
+    )
+
+    # ----------------------------------------------------------
+    # LiDAR sensor frame -> car frame
+    # ----------------------------------------------------------
+    #
+    # Matrix multiplication:
+    #
+    # (3 x 3) @ (3 x N)
+    #          =
+    #        (3 x N)
+    #
+    # Then NumPy broadcasts the (3 x 1) translation across all
+    # N point columns.
+    carPoints = (
+        rotationMatrix
+        @ lidarPoints
+        + translationVector
+    )
+
+    return {
+        "lidarPoints": lidarPoints,
+
+        "carPoints": carPoints,
+
+        "intensity": intensity,
+
+        "rotationMatrix": rotationMatrix,
+
+        "translationVector": translationVector
+    }
+
+
+def filterPointsToBev(
+    lidarPointCloud,
+    lidarCalibration,
+    bevConfig
+):
+    """
+    Transform LiDAR points into the car frame and retain points
+    inside the configured car-frame BEV region.
+
+    Car coordinate convention:
+
+        +x = forward
+        +y = left
+        +z = up
+
+    The original sensor-frame coordinates are retained alongside
+    the car-frame coordinates so the verified self-return mask can
+    continue operating in the raw LIDAR_TOP frame.
+    """
+
+    transformedPoints = transformLidarToCar(
+        lidarPointCloud,
+        lidarCalibration
+    )
+
+    lidarPoints = transformedPoints[
+        "lidarPoints"
+    ]
+
+    carPoints = transformedPoints[
+        "carPoints"
+    ]
+
+    intensity = transformedPoints[
+        "intensity"
+    ]
+
+    # ----------------------------------------------------------
+    # Original LIDAR_TOP sensor coordinates
+    # ----------------------------------------------------------
+
+    lidarX = lidarPoints[
+        0,
+        :
+    ]
+
+    lidarY = lidarPoints[
+        1,
+        :
+    ]
+
+    lidarZ = lidarPoints[
+        2,
+        :
+    ]
+
+    # ----------------------------------------------------------
+    # Car-frame coordinates
+    # ----------------------------------------------------------
+
+    carX = carPoints[
+        0,
+        :
+    ]
+
+    carY = carPoints[
+        1,
+        :
+    ]
+
+    carZ = carPoints[
+        2,
+        :
+    ]
+
+    # ----------------------------------------------------------
+    # BEV crop in the CAR FRAME
+    # ----------------------------------------------------------
+    #
+    # Use half-open upper bounds:
+    #
+    # xMin <= x < xMax
+    # yMin <= y < yMax
+    #
+    # This prevents a point exactly at xMax/yMax from generating
+    # an out-of-range grid index.
     bevMask = (
-        (x >= bevConfig["xMinM"])
-        & (x < bevConfig["xMaxM"])
-        & (y >= bevConfig["yMinM"])
-        & (y < bevConfig["yMaxM"])
+        (carX >= bevConfig["xMinM"])
+        & (carX < bevConfig["xMaxM"])
+        & (carY >= bevConfig["yMinM"])
+        & (carY < bevConfig["yMaxM"])
     )
 
     return {
         "bevMask": bevMask,
-        "x": x[bevMask],
-        "y": y[bevMask],
-        "z": z[bevMask],
-        "intensity": intensity[bevMask]
+
+        # Car-frame coordinates used for RANSAC and BEV.
+        "x": carX[
+            bevMask
+        ],
+
+        "y": carY[
+            bevMask
+        ],
+
+        "z": carZ[
+            bevMask
+        ],
+
+        # Original sensor coordinates remain aligned with x/y/z.
+        "lidarX": lidarX[
+            bevMask
+        ],
+
+        "lidarY": lidarY[
+            bevMask
+        ],
+
+        "lidarZ": lidarZ[
+            bevMask
+        ],
+
+        "intensity": intensity[
+            bevMask
+        ],
+
+        "lidarToCarRotationMatrix": transformedPoints[
+            "rotationMatrix"
+        ],
+
+        "lidarToCarTranslationVector": transformedPoints[
+            "translationVector"
+        ]
     }
 
 
@@ -46,8 +255,11 @@ def selectGroundCandidates(
     """
     Select low-height points as possible road/ground points.
 
-    This is only candidate selection. RANSAC decides which
-    candidate points actually belong to the dominant ground plane.
+    z is now expressed in the car coordinate frame.
+
+    This step only produces plausible ground candidates.
+    RANSAC decides which candidates actually fit the dominant
+    road plane.
     """
 
     groundLowerZ = np.percentile(
@@ -156,17 +368,18 @@ def estimateGroundPlaneRansac(
     bevConfig
 ):
     """
-    Estimate the dominant ground plane using RANSAC.
+    Estimate the dominant ground plane in the car frame using
+    RANSAC.
 
     Process:
 
         1. Select plausible low-z ground points.
         2. Randomly choose 3 points.
-        3. Fit a plane through the 3 points.
-        4. Measure candidate distances to that plane.
-        5. Count RANSAC inliers.
-        6. Keep the best plane.
-        7. Refit using least squares over all best inliers.
+        3. Fit a plane through those 3 points.
+        4. Measure candidate distances to the plane.
+        5. Count points inside the RANSAC distance threshold.
+        6. Keep the best hypothesis.
+        7. Refit that plane using least squares over its inliers.
     """
 
     (
@@ -175,8 +388,12 @@ def estimateGroundPlaneRansac(
         groundUpperZ
     ) = selectGroundCandidates(
         z,
-        bevConfig["groundLowerPercentile"],
-        bevConfig["groundUpperPercentile"]
+        bevConfig[
+            "groundLowerPercentile"
+        ],
+        bevConfig[
+            "groundUpperPercentile"
+        ]
     )
 
     xGround = x[
@@ -199,15 +416,21 @@ def estimateGroundPlaneRansac(
         )
 
     randomGenerator = np.random.default_rng(
-        bevConfig["ransacRandomSeed"]
+        bevConfig[
+            "ransacRandomSeed"
+        ]
     )
 
     bestInlierMask = None
+
     bestInlierCount = 0
+
     bestMeanDistance = np.inf
 
     for _ in range(
-        bevConfig["ransacIterations"]
+        bevConfig[
+            "ransacIterations"
+        ]
     ):
 
         sampleIndices = randomGenerator.choice(
@@ -236,7 +459,8 @@ def estimateGroundPlaneRansac(
             )
         )
 
-        # Three collinear points do not give a reliable plane.
+        # Three linearly dependent points cannot uniquely
+        # determine the plane coefficients.
         if np.linalg.matrix_rank(
             sampleMatrix
         ) < 3:
@@ -256,7 +480,9 @@ def estimateGroundPlaneRansac(
 
         inlierMask = (
             distances
-            <= bevConfig["ransacDistanceThresholdM"]
+            <= bevConfig[
+                "ransacDistanceThresholdM"
+            ]
         )
 
         inlierCount = int(
@@ -276,6 +502,10 @@ def estimateGroundPlaneRansac(
             )
         )
 
+        # First maximize inlier count.
+        #
+        # If two models contain the same number of inliers,
+        # choose the one with the smaller mean inlier error.
         if (
             inlierCount > bestInlierCount
             or (
@@ -284,7 +514,9 @@ def estimateGroundPlaneRansac(
             )
         ):
             bestInlierMask = inlierMask
+
             bestInlierCount = inlierCount
+
             bestMeanDistance = meanInlierDistance
 
     if bestInlierMask is None:
@@ -292,7 +524,10 @@ def estimateGroundPlaneRansac(
             "RANSAC could not find a valid ground plane."
         )
 
-    # Refine the best RANSAC hypothesis using all its inliers.
+    # RANSAC selects the correct subset of ground points.
+    #
+    # Least squares then computes a more accurate final plane
+    # using all inliers belonging to the best hypothesis.
     finalPlaneCoefficients = fitPlaneLeastSquares(
         xGround[
             bestInlierMask
@@ -335,15 +570,16 @@ def calculateHeightAboveGround(
     planeCoefficients
 ):
     """
-    Calculate each LiDAR point's height above the fitted ground.
+    Calculate each car-frame LiDAR point's height above the fitted
+    ground plane.
 
     Ground:
 
-        groundZ = a*x + b*y + c
+        estimatedGroundZ = a*x + b*y + c
 
     Height:
 
-        heightAboveGround = z - groundZ
+        heightAboveGround = z - estimatedGroundZ
     """
 
     a, b, c = planeCoefficients
@@ -366,37 +602,66 @@ def calculateHeightAboveGround(
 
 
 def createSelfReturnMask(
-    x,
-    y,
-    z,
+    lidarX,
+    lidarY,
+    lidarZ,
     bevConfig
 ):
     """
-    Identify known near-sensor LiDAR returns produced by the
-    car / LiDAR mounting structure.
+    Identify known near-sensor returns using the ORIGINAL
+    LIDAR_TOP sensor coordinate frame.
 
-    The region is defined in the raw LIDAR_TOP coordinate frame.
+    This is intentional.
 
-    A point is inside the self-return region only when all three
-    coordinate conditions are satisfied simultaneously:
+    The self-return bounds were experimentally verified in the
+    raw LiDAR frame, so converting these points into the car frame
+    before applying those bounds would change the meaning of the
+    calibrated filtering region.
 
-        xMin <= x <= xMax
-        yMin <= y <= yMax
-        zMin <= z <= zMax
+    A point is a self return when:
 
-    The original LiDAR data is not deleted.
-
-    The mask is used only to prevent known car returns from
-    becoming external obstacles.
+        xMin <= lidarX <= xMax
+        yMin <= lidarY <= yMax
+        zMin <= lidarZ <= zMax
     """
 
     selfReturnMask = (
-        (x >= bevConfig["selfReturnXMinM"])
-        & (x <= bevConfig["selfReturnXMaxM"])
-        & (y >= bevConfig["selfReturnYMinM"])
-        & (y <= bevConfig["selfReturnYMaxM"])
-        & (z >= bevConfig["selfReturnZMinM"])
-        & (z <= bevConfig["selfReturnZMaxM"])
+        (
+            lidarX
+            >= bevConfig[
+                "selfReturnXMinM"
+            ]
+        )
+        & (
+            lidarX
+            <= bevConfig[
+                "selfReturnXMaxM"
+            ]
+        )
+        & (
+            lidarY
+            >= bevConfig[
+                "selfReturnYMinM"
+            ]
+        )
+        & (
+            lidarY
+            <= bevConfig[
+                "selfReturnYMaxM"
+            ]
+        )
+        & (
+            lidarZ
+            >= bevConfig[
+                "selfReturnZMinM"
+            ]
+        )
+        & (
+            lidarZ
+            <= bevConfig[
+                "selfReturnZMaxM"
+            ]
+        )
     )
 
     return selfReturnMask
@@ -406,36 +671,62 @@ def calculateBevGridSize(
     bevConfig
 ):
     """
-    Calculate the number of rows and columns in the BEV grid.
+    Calculate BEV rows and columns.
 
-    Example:
+    Current configuration:
 
-        x range = 50 - (-20)
-                = 70 m
+        x:
+            -20 m to +50 m
+            = 70 m
 
-        resolution = 0.20 m/cell
+        y:
+            -25 m to +25 m
+            = 50 m
 
-        rows = 70 / 0.20
-             = 350
+        resolution:
+            0.20 m/cell
+
+    Therefore:
+
+        bevHeight = 70 / 0.20
+                  = 350 rows
+
+        bevWidth = 50 / 0.20
+                 = 250 columns
     """
 
     bevHeight = int(
         (
-            bevConfig["xMaxM"]
-            - bevConfig["xMinM"]
+            bevConfig[
+                "xMaxM"
+            ]
+            - bevConfig[
+                "xMinM"
+            ]
         )
-        / bevConfig["resolutionM"]
+        / bevConfig[
+            "resolutionM"
+        ]
     )
 
     bevWidth = int(
         (
-            bevConfig["yMaxM"]
-            - bevConfig["yMinM"]
+            bevConfig[
+                "yMaxM"
+            ]
+            - bevConfig[
+                "yMinM"
+            ]
         )
-        / bevConfig["resolutionM"]
+        / bevConfig[
+            "resolutionM"
+        ]
     )
 
-    return bevHeight, bevWidth
+    return (
+        bevHeight,
+        bevWidth
+    )
 
 
 def convertMetersToBevGrid(
@@ -444,7 +735,22 @@ def convertMetersToBevGrid(
     bevConfig
 ):
     """
-    Convert metric LiDAR x/y positions into BEV row/column indices.
+    Convert CAR-FRAME metric x/y coordinates into BEV
+    row/column indices.
+
+    First:
+
+        xCell = floor(
+            (x - xMin)
+            / resolution
+        )
+
+        yCell = floor(
+            (y - yMin)
+            / resolution
+        )
+
+    Then convert physical grid coordinates to image coordinates.
     """
 
     bevHeight, bevWidth = calculateBevGridSize(
@@ -454,9 +760,13 @@ def convertMetersToBevGrid(
     xCell = np.floor(
         (
             x
-            - bevConfig["xMinM"]
+            - bevConfig[
+                "xMinM"
+            ]
         )
-        / bevConfig["resolutionM"]
+        / bevConfig[
+            "resolutionM"
+        ]
     ).astype(
         np.int32
     )
@@ -464,23 +774,32 @@ def convertMetersToBevGrid(
     yCell = np.floor(
         (
             y
-            - bevConfig["yMinM"]
+            - bevConfig[
+                "yMinM"
+            ]
         )
-        / bevConfig["resolutionM"]
+        / bevConfig[
+            "resolutionM"
+        ]
     ).astype(
         np.int32
     )
 
-    # Image row 0 is at the top.
-    # Invert x so +x forward appears toward the top.
+    # Image row zero is at the top.
+    #
+    # Therefore invert x so +x / forward appears toward the
+    # top of the BEV.
     bevRow = (
         bevHeight
         - 1
         - xCell
     )
 
-    # +y is left in the LiDAR frame.
-    # Smaller image columns are left, so invert y.
+    # In the car frame:
+    #
+    # +y = left.
+    #
+    # Smaller image columns appear on the left, so invert y too.
     bevColumn = (
         bevWidth
         - 1
@@ -502,7 +821,7 @@ def createDensityGrid(
     bevWidth
 ):
     """
-    Count LiDAR returns in each BEV grid cell.
+    Count points falling into each BEV cell.
     """
 
     densityGrid = np.zeros(
@@ -529,7 +848,11 @@ def createDisplayDensity(
     densityGrid
 ):
     """
-    Log-compress and normalize raw LiDAR density for visualization.
+    Create a log-compressed normalized density image for
+    visualization.
+
+    This does not change the raw density used in the
+    multi-channel BEV.
     """
 
     displayDensity = np.log1p(
@@ -541,6 +864,7 @@ def createDisplayDensity(
     )
 
     if maximumDensity > 0:
+
         displayDensity = (
             displayDensity
             / maximumDensity
@@ -553,7 +877,15 @@ def calculateCarGridPosition(
     bevConfig
 ):
     """
-    Find the BEV cell corresponding to LiDAR origin (0, 0).
+    Convert the actual car-frame origin:
+
+        xCar = 0
+        yCar = 0
+
+    into its BEV row/column.
+
+    Now that the BEV itself is in the car frame, this is truly the
+    car origin rather than the LIDAR_TOP sensor origin.
     """
 
     carX = np.array(
@@ -585,44 +917,234 @@ def calculateCarGridPosition(
     )
 
 
+def createMaxHeightGrid(
+    bevRow,
+    bevColumn,
+    heightAboveGround,
+    bevHeight,
+    bevWidth
+):
+    """
+    Store the maximum ground-relative obstacle height observed in
+    each BEV cell.
+    """
+
+    maxHeightGrid = np.zeros(
+        (
+            bevHeight,
+            bevWidth
+        ),
+        dtype=np.float32
+    )
+
+    np.maximum.at(
+        maxHeightGrid,
+        (
+            bevRow,
+            bevColumn
+        ),
+        heightAboveGround
+    )
+
+    return maxHeightGrid
+
+
+def createMeanIntensityGrid(
+    bevRow,
+    bevColumn,
+    intensity,
+    bevHeight,
+    bevWidth
+):
+    """
+    Calculate mean LiDAR intensity in every occupied BEV cell.
+
+    For each cell:
+
+                    sum of intensities
+        mean = -----------------------------
+               number of LiDAR points
+    """
+
+    intensitySumGrid = np.zeros(
+        (
+            bevHeight,
+            bevWidth
+        ),
+        dtype=np.float32
+    )
+
+    intensityCountGrid = np.zeros(
+        (
+            bevHeight,
+            bevWidth
+        ),
+        dtype=np.float32
+    )
+
+    np.add.at(
+        intensitySumGrid,
+        (
+            bevRow,
+            bevColumn
+        ),
+        intensity
+    )
+
+    np.add.at(
+        intensityCountGrid,
+        (
+            bevRow,
+            bevColumn
+        ),
+        1
+    )
+
+    meanIntensityGrid = np.zeros(
+        (
+            bevHeight,
+            bevWidth
+        ),
+        dtype=np.float32
+    )
+
+    occupiedIntensityMask = (
+        intensityCountGrid > 0
+    )
+
+    meanIntensityGrid[
+        occupiedIntensityMask
+    ] = (
+        intensitySumGrid[
+            occupiedIntensityMask
+        ]
+        / intensityCountGrid[
+            occupiedIntensityMask
+        ]
+    )
+
+    return meanIntensityGrid
+
+
+def createOccupancyGrid(
+    densityGrid
+):
+    """
+    Create binary external-obstacle occupancy.
+
+    Each cell is:
+
+        0 = no clean obstacle points
+        1 = one or more clean obstacle points
+    """
+
+    occupancyGrid = (
+        densityGrid > 0
+    ).astype(
+        np.float32
+    )
+
+    return occupancyGrid
+
+
+def createMultiChannelBev(
+    densityGrid,
+    maxHeightGrid,
+    meanIntensityGrid,
+    occupancyGrid
+):
+    """
+    Stack the four spatially aligned LiDAR BEV channels.
+
+    Channel 0:
+        clean obstacle density
+
+    Channel 1:
+        maximum height above ground
+
+    Channel 2:
+        mean LiDAR intensity
+
+    Channel 3:
+        binary occupancy
+
+    Output:
+
+        (4, bevHeight, bevWidth)
+
+    Current configuration:
+
+        (4, 350, 250)
+    """
+
+    multiChannelBev = np.stack(
+        (
+            densityGrid,
+            maxHeightGrid,
+            meanIntensityGrid,
+            occupancyGrid
+        ),
+        axis=0
+    )
+
+    return multiChannelBev
+
+
 def processLidarBev(
     frameData,
     bevConfig
 ):
     """
-    Process the exact LiDAR point cloud supplied by run_navfusion.py.
+    Generate a car-frame multi-channel LiDAR BEV.
 
-    Flow:
+    Processing flow:
 
-        LiDAR
-          ↓
-        BEV spatial crop
-          ↓
+        raw LIDAR_TOP
+               ↓
+        LiDAR -> car calibration
+               ↓
+        car-frame point cloud
+               ↓
+        car-frame BEV crop
+               ↓
         RANSAC ground estimation
-          ↓
+               ↓
         height above ground
-          ↓
+               ↓
         obstacle candidates
-          ↓
-        self-return mask
-          ↓
+               ↓
+        raw-sensor-frame self-return mask
+               ↓
         clean external obstacles
-          ↓
-        BEV density rasters
+               ↓
+        car-frame metric rasterization
+               ↓
+        density / height / intensity / occupancy
+               ↓
+        multi-channel BEV
     """
 
     lidarPointCloud = frameData[
         "lidarPointCloud"
     ]
 
+    lidarCalibration = frameData[
+        "lidarCalibration"
+    ]
+
     # ----------------------------------------------------------
-    # Crop to the configured BEV region
+    # Transform LiDAR -> car and crop in the car frame
     # ----------------------------------------------------------
 
     filteredPoints = filterPointsToBev(
         lidarPointCloud,
+        lidarCalibration,
         bevConfig
     )
+
+    # ----------------------------------------------------------
+    # Car-frame point coordinates
+    # ----------------------------------------------------------
 
     x = filteredPoints[
         "x"
@@ -636,12 +1158,31 @@ def processLidarBev(
         "z"
     ]
 
+    # ----------------------------------------------------------
+    # Matching original LIDAR_TOP coordinates
+    # ----------------------------------------------------------
+    #
+    # These arrays have exactly the same length/order as x/y/z
+    # because the SAME bevMask was applied to both coordinate
+    # representations.
+    lidarX = filteredPoints[
+        "lidarX"
+    ]
+
+    lidarY = filteredPoints[
+        "lidarY"
+    ]
+
+    lidarZ = filteredPoints[
+        "lidarZ"
+    ]
+
     intensity = filteredPoints[
         "intensity"
     ]
 
     # ----------------------------------------------------------
-    # Estimate the road/ground plane with RANSAC
+    # Estimate ground in the CAR FRAME
     # ----------------------------------------------------------
 
     groundResult = estimateGroundPlaneRansac(
@@ -652,7 +1193,7 @@ def processLidarBev(
     )
 
     # ----------------------------------------------------------
-    # Calculate height above estimated ground
+    # Calculate car-frame height above ground
     # ----------------------------------------------------------
 
     (
@@ -671,8 +1212,6 @@ def processLidarBev(
     # Initial obstacle candidates
     # ----------------------------------------------------------
 
-    # Any return more than the configured height above the
-    # estimated ground becomes an initial obstacle candidate.
     obstacleCandidateMask = (
         heightAboveGround
         > bevConfig[
@@ -681,13 +1220,17 @@ def processLidarBev(
     )
 
     # ----------------------------------------------------------
-    # Detect known car / sensor self returns
+    # Self-return filtering in ORIGINAL SENSOR FRAME
     # ----------------------------------------------------------
-
+    #
+    # Do not use car-frame x/y/z here.
+    #
+    # The current self-return bounds were validated using
+    # LIDAR_TOP coordinates.
     selfReturnMask = createSelfReturnMask(
-        x,
-        y,
-        z,
+        lidarX,
+        lidarY,
+        lidarZ,
         bevConfig
     )
 
@@ -695,22 +1238,13 @@ def processLidarBev(
     # Clean external obstacle mask
     # ----------------------------------------------------------
 
-    # ~ means Boolean NOT.
-    #
-    # Therefore:
-    #
-    # obstacle candidate
-    # AND
-    # NOT self return
-    #
-    # becomes a clean external obstacle.
     obstacleMask = (
         obstacleCandidateMask
         & (~selfReturnMask)
     )
 
     # ----------------------------------------------------------
-    # Convert every BEV-region point into grid coordinates
+    # Convert CAR-FRAME x/y into the metric BEV grid
     # ----------------------------------------------------------
 
     (
@@ -725,7 +1259,7 @@ def processLidarBev(
     )
 
     # ----------------------------------------------------------
-    # Raw LiDAR density
+    # Raw car-frame LiDAR density
     # ----------------------------------------------------------
 
     bevDensity = createDensityGrid(
@@ -736,7 +1270,7 @@ def processLidarBev(
     )
 
     # ----------------------------------------------------------
-    # RANSAC obstacles BEFORE self-return filtering
+    # Obstacles before self filtering
     # ----------------------------------------------------------
 
     obstacleCandidateRow = bevRow[
@@ -755,7 +1289,7 @@ def processLidarBev(
     )
 
     # ----------------------------------------------------------
-    # RANSAC obstacles AFTER self-return filtering
+    # Clean obstacle locations
     # ----------------------------------------------------------
 
     obstacleRow = bevRow[
@@ -766,6 +1300,18 @@ def processLidarBev(
         obstacleMask
     ]
 
+    obstacleHeightAboveGround = heightAboveGround[
+        obstacleMask
+    ]
+
+    obstacleIntensity = intensity[
+        obstacleMask
+    ]
+
+    # ----------------------------------------------------------
+    # Channel 0: obstacle density
+    # ----------------------------------------------------------
+
     obstacleDensity = createDensityGrid(
         obstacleRow,
         obstacleColumn,
@@ -774,7 +1320,50 @@ def processLidarBev(
     )
 
     # ----------------------------------------------------------
-    # Display-friendly density maps
+    # Channel 1: maximum height above ground
+    # ----------------------------------------------------------
+
+    maxHeightGrid = createMaxHeightGrid(
+        obstacleRow,
+        obstacleColumn,
+        obstacleHeightAboveGround,
+        bevHeight,
+        bevWidth
+    )
+
+    # ----------------------------------------------------------
+    # Channel 2: mean intensity
+    # ----------------------------------------------------------
+
+    meanIntensityGrid = createMeanIntensityGrid(
+        obstacleRow,
+        obstacleColumn,
+        obstacleIntensity,
+        bevHeight,
+        bevWidth
+    )
+
+    # ----------------------------------------------------------
+    # Channel 3: binary occupancy
+    # ----------------------------------------------------------
+
+    occupancyGrid = createOccupancyGrid(
+        obstacleDensity
+    )
+
+    # ----------------------------------------------------------
+    # Four-channel car-frame BEV tensor
+    # ----------------------------------------------------------
+
+    multiChannelBev = createMultiChannelBev(
+        obstacleDensity,
+        maxHeightGrid,
+        meanIntensityGrid,
+        occupancyGrid
+    )
+
+    # ----------------------------------------------------------
+    # Display-only density maps
     # ----------------------------------------------------------
 
     bevDisplayDensity = createDisplayDensity(
@@ -790,7 +1379,7 @@ def processLidarBev(
     )
 
     # ----------------------------------------------------------
-    # Car position in the BEV grid
+    # Actual car origin in car-frame BEV
     # ----------------------------------------------------------
 
     carRow, carColumn = calculateCarGridPosition(
@@ -798,17 +1387,50 @@ def processLidarBev(
     )
 
     # ----------------------------------------------------------
-    # Return every intermediate result
+    # LiDAR sensor position in the CAR FRAME
+    # ----------------------------------------------------------
+    #
+    # The calibrated_sensor translation is the location of the
+    # LIDAR_TOP origin relative to the car origin.
+    lidarSensorPositionCarM = (
+        filteredPoints[
+            "lidarToCarTranslationVector"
+        ]
+        .reshape(
+            3
+        )
+    )
+
+    # ----------------------------------------------------------
+    # Return results
     # ----------------------------------------------------------
 
     return {
+        # These are now CAR-FRAME coordinates.
         "x": x,
 
         "y": y,
 
         "z": z,
 
+        # Matching raw LIDAR_TOP coordinates.
+        "lidarX": lidarX,
+
+        "lidarY": lidarY,
+
+        "lidarZ": lidarZ,
+
         "intensity": intensity,
+
+        "lidarToCarRotationMatrix": filteredPoints[
+            "lidarToCarRotationMatrix"
+        ],
+
+        "lidarToCarTranslationVector": filteredPoints[
+            "lidarToCarTranslationVector"
+        ],
+
+        "lidarSensorPositionCarM": lidarSensorPositionCarM,
 
         "estimatedGroundZ": estimatedGroundZ,
 
@@ -833,6 +1455,14 @@ def processLidarBev(
         "obstacleCandidateDensity": obstacleCandidateDensity,
 
         "obstacleDensity": obstacleDensity,
+
+        "maxHeightGrid": maxHeightGrid,
+
+        "meanIntensityGrid": meanIntensityGrid,
+
+        "occupancyGrid": occupancyGrid,
+
+        "multiChannelBev": multiChannelBev,
 
         "bevDisplayDensity": bevDisplayDensity,
 

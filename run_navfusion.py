@@ -573,6 +573,21 @@ def printLidarBevSummary(
         removedSelfObstacleMask.sum()
     )
 
+    lidarSensorX, lidarSensorY, lidarSensorZ = bevResult[
+        "lidarSensorPositionCarM"
+    ]
+
+    print()
+    print("LiDAR -> car calibration:")
+    print("-------------------------")
+
+    print(
+        f"LiDAR position in car frame: "
+        f"x={lidarSensorX:.3f}, "
+        f"y={lidarSensorY:.3f}, "
+        f"z={lidarSensorZ:.3f} m"
+    )
+
     print()
     print("RANSAC ground plane:")
     print("--------------------")
@@ -621,6 +636,35 @@ def printLidarBevSummary(
     print(
         f"Clean obstacles     : "
         f"{bevResult['obstacleMask'].sum()}"
+    )
+
+    print()
+    print("Multi-channel BEV:")
+    print("------------------")
+
+    print(
+        f"Tensor shape        : "
+        f"{bevResult['multiChannelBev'].shape}"
+    )
+
+    print(
+        f"Occupied cells      : "
+        f"{int(bevResult['occupancyGrid'].sum())}"
+    )
+
+    print(
+        f"Maximum cell density: "
+        f"{bevResult['obstacleDensity'].max():.0f}"
+    )
+
+    print(
+        f"Maximum height      : "
+        f"{bevResult['maxHeightGrid'].max():.2f} m"
+    )
+
+    print(
+        f"Maximum mean intensity: "
+        f"{bevResult['meanIntensityGrid'].max():.2f}"
     )
 
 
