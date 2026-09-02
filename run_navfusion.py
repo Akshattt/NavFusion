@@ -15,6 +15,8 @@ from navfusion.mapping.semantic_bev import createSemanticBev
 from navfusion.visualization.sensor_fusion_visualizer import (
     createSensorFusionFigure
 )
+from navfusion.mapping.camera_ipm import processCameraIpm
+from navfusion.mapping.camera_lidar_fusion import processCameraLidarFusion
 
 
 # ==============================================================
@@ -40,6 +42,7 @@ from navfusion.visualization.sensor_fusion_visualizer import (
 #
 # For the current full-dataset video run:
 outputMode = "video"
+#outputMode = "photo"
 
 
 # ==============================================================
@@ -190,6 +193,34 @@ bevConfig = {
     "selfReturnZMaxM": 0.2
 }
 
+# ==============================================================
+# Camera IPM configuration
+# ==============================================================
+
+ipmConfig = {
+    # Ground cells closer than this to/behind the camera optical
+    # plane are not projected.
+    "minimumCameraDepthM": 0.10
+}
+
+# ==============================================================
+# Camera + LiDAR fusion configuration
+# ==============================================================
+
+cameraLidarFusionConfig = {
+    # LiDAR obstacle with no known vehicle class.
+    "unlabeledObstacleColorRgb": (
+        160,
+        160,
+        160
+    ),
+
+    # Preserve some Camera-IPM texture under LiDAR obstacles.
+    "unlabeledObstacleAlpha": 0.70,
+
+    # Semantic vehicle cells should be visually dominant.
+    "semanticAlpha": 0.95
+}
 
 # ==============================================================
 # Visualization configuration
@@ -213,7 +244,7 @@ videoFps = 2.0
 #
 # Therefore that earlier video is never touched by this run.
 semanticVideoFileName = (
-    "navfusion_semantic_bev_full_dataset.mp4"
+    "navfusion_semantic)_IPM_bev_only_front_full_dataset.mp4"
 )
 
 
@@ -1326,6 +1357,219 @@ def main():
                     bevResult,
                     bevConfig
                 )
+
+                #CAM_FRONT inverse-perspective mapping
+
+                ipmResult = processCameraIpm(
+                    frameData,
+                    bevResult,
+                    bevConfig,
+                    ipmConfig
+                )
+
+                # ------------------------------------------------
+                # Camera IPM + LiDAR + semantic fusion
+                # ------------------------------------------------
+
+                cameraLidarFusionResult = processCameraLidarFusion(
+                    ipmResult,
+                    bevResult,
+                    semanticResult,
+                    cameraLidarFusionConfig
+                )
+
+                print()
+                print("Camera IPM:")
+                print("-----------")
+
+                print(
+                    f"IPM shape       : "
+                    f"{ipmResult['cameraIpmRgb'].shape}"
+                )
+
+                print(
+                    f"Valid BEV cells : "
+                    f"{ipmResult['validCellCount']} / "
+                    f"{ipmResult['totalCellCount']}"
+                )
+
+                print(
+                    f"Camera coverage : "
+                    f"{ipmResult['coveragePercent']:.2f}%"
+                )
+
+
+                print()
+                print("Camera + LiDAR fused BEV:")
+                print("-------------------------")
+
+                print(
+                    f"Fused shape              : "
+                    f"{cameraLidarFusionResult['fusedBevRgb'].shape}"
+                )
+
+                print(
+                    f"LiDAR obstacle cells     : "
+                    f"{cameraLidarFusionResult['occupiedCellCount']}"
+                )
+
+                print(
+                    f"Semantic vehicle cells   : "
+                    f"{cameraLidarFusionResult['semanticCellCount']}"
+                )
+
+                print(
+                    f"Unlabeled obstacle cells : "
+                    f"{cameraLidarFusionResult['unlabeledObstacleCellCount']}"
+                )
+
+                print(
+                    f"Camera-visible obstacles : "
+                    f"{cameraLidarFusionResult['cameraVisibleObstacleCellCount']}"
+                )
+                # ------------------------------------------------
+                # Save and display Camera + LiDAR fused BEV
+                # ------------------------------------------------
+
+                if outputMode == "photo":
+
+                    outputDirectory.mkdir(
+                        parents=True,
+                        exist_ok=True
+                    )
+
+                    fusedOutputPath = (
+                        outputDirectory
+                        / (
+                            f"{scene['name']}_"
+                            f"sample_{sampleIndex:04d}_"
+                            f"camera_lidar_fused_bev.png"
+                        )
+                    )
+
+                    fusedFigure, fusedAxis = plt.subplots(
+                        1,
+                        1,
+                        figsize=(
+                            7,
+                            10
+                        )
+                    )
+
+                    # ------------------------------------------------
+                    # Display the actual fused RGB BEV
+                    # ------------------------------------------------
+                    #
+                    # Camera IPM
+                    #     +
+                    # LiDAR obstacle occupancy
+                    #     +
+                    # semantic vehicle-class colors
+                    fusedAxis.imshow(
+                        cameraLidarFusionResult[
+                            "fusedBevRgb"
+                        ],
+                        origin="upper"
+                    )
+
+                    # ------------------------------------------------
+                    # Draw car origin
+                    # ------------------------------------------------
+
+                    fusedAxis.scatter(
+                        bevResult[
+                            "carColumn"
+                        ],
+                        bevResult[
+                            "carRow"
+                        ],
+                        marker="^",
+                        s=80,
+                        label="Car"
+                    )
+
+                    # ------------------------------------------------
+                    # Draw semantic object labels
+                    # ------------------------------------------------
+
+                    for objectSummary in semanticResult[
+                        "objectSummaries"
+                    ]:
+
+                        centerRow = objectSummary[
+                            "centerRow"
+                        ]
+
+                        centerColumn = objectSummary[
+                            "centerColumn"
+                        ]
+
+                        if (
+                            centerRow is None
+                            or centerColumn is None
+                        ):
+                            continue
+
+                        fusedAxis.text(
+                            centerColumn,
+                            centerRow,
+                            objectSummary[
+                                "className"
+                            ].upper(),
+                            fontsize=8,
+                            ha="center",
+                            va="center",
+                            bbox={
+                                "facecolor": "white",
+                                "alpha": 0.85,
+                                "edgecolor": "black"
+                            }
+                        )
+
+                    # ------------------------------------------------
+                    # Axis information
+                    # ------------------------------------------------
+
+                    fusedAxis.set_title(
+                        "Fused Camera-IPM + LiDAR + Vehicle Semantics"
+                    )
+
+                    fusedAxis.set_xlabel(
+                        "BEV column (+y left)"
+                    )
+
+                    fusedAxis.set_ylabel(
+                        "BEV row (+x forward)"
+                    )
+
+                    fusedAxis.legend(
+                        loc="lower right"
+                    )
+
+                    fusedFigure.tight_layout()
+
+                    # ------------------------------------------------
+                    # Save fused diagnostic image
+                    # ------------------------------------------------
+
+                    fusedFigure.savefig(
+                        fusedOutputPath,
+                        dpi=150,
+                        bbox_inches="tight"
+                    )
+
+                    print()
+                    print(
+                        f"Fused Camera-LiDAR BEV saved to:\n"
+                        f"{fusedOutputPath}"
+                    )
+
+                    # Show only in photo mode.
+                    plt.show()
+
+                    plt.close(
+                        fusedFigure
+                    )
 
                 # ------------------------------------------------
                 # Console diagnostics
