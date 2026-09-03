@@ -40,9 +40,12 @@ from navfusion.mapping.camera_lidar_fusion import processCameraLidarFusion
 #     Do not save individual PNG files.
 #     Save one protected semantic-BEV MP4.
 #
-# For the current full-dataset video run:
-outputMode = "video"
-#outputMode = "photo"
+# For six-camera IPM validation:
+#
+# Process only the first sample until the six individual camera
+# projections have been verified.
+#outputMode = "video"
+outputMode = "photo"
 
 
 # ==============================================================
@@ -80,7 +83,24 @@ outputDirectory = (
 
 datasetVersion = "v1.0-mini"
 
+# Existing YOLO + LiDAR fusion camera.
+#
+# Keep this unchanged so the verified front-camera perception
+# pipeline continues to behave exactly as before.
 cameraChannel = "CAM_FRONT"
+
+# All six nuScenes cameras used for surround IPM generation.
+#
+# Each camera will reuse the existing processCameraIpm()
+# mathematics with its own image, calibration and camera-time pose.
+ipmCameraChannels = (
+    "CAM_FRONT",
+    "CAM_FRONT_LEFT",
+    "CAM_FRONT_RIGHT",
+    "CAM_BACK",
+    "CAM_BACK_LEFT",
+    "CAM_BACK_RIGHT"
+)
 
 lidarChannel = "LIDAR_TOP"
 
@@ -474,6 +494,452 @@ def loadFrameData(
     }
 
     return frameData
+
+
+# ==============================================================
+# Create frame data for one selected camera
+# ==============================================================
+
+def createCameraFrameData(
+    loader,
+    sample,
+    frameData,
+    sensorChannel
+):
+    """
+    Create a temporary frameData dictionary for one camera.
+
+    The LiDAR sample and LiDAR-time pose remain unchanged.
+
+    Only the camera-specific values are replaced:
+
+        camera channel
+        camera sample_data record
+        camera path
+        camera image
+        camera calibration
+        camera-time car pose
+
+    This lets the existing processCameraIpm() function be reused
+    for every nuScenes surround camera without duplicating the IPM
+    geometry or changing the verified front-camera fusion pipeline.
+    """
+
+    # CAM_FRONT is already loaded by loadFrameData().
+    #
+    # Reuse it directly instead of loading the same image and
+    # nuScenes records a second time.
+    if sensorChannel == frameData[
+        "cameraChannel"
+    ]:
+        return frameData
+
+    # ----------------------------------------------------------
+    # Camera sample_data record and image path
+    # ----------------------------------------------------------
+
+    cameraRecord, cameraPath = getSensorRecordAndPath(
+        loader,
+        sample,
+        sensorChannel
+    )
+
+    # ----------------------------------------------------------
+    # Camera image
+    # ----------------------------------------------------------
+
+    cameraImage = Image.open(
+        cameraPath
+    ).convert(
+        "RGB"
+    )
+
+    # ----------------------------------------------------------
+    # Camera calibrated_sensor record
+    # ----------------------------------------------------------
+
+    cameraCalibration = loader.nusc.get(
+        "calibrated_sensor",
+        cameraRecord[
+            "calibrated_sensor_token"
+        ]
+    )
+
+    # ----------------------------------------------------------
+    # Car pose at this camera's timestamp
+    # ----------------------------------------------------------
+
+    # "ego_pose" is the exact nuScenes schema/table name.
+    cameraCarPose = loader.nusc.get(
+        "ego_pose",
+        cameraRecord[
+            "ego_pose_token"
+        ]
+    )
+
+    # ----------------------------------------------------------
+    # Copy the synchronized frame
+    # ----------------------------------------------------------
+    #
+    # frameData.copy() creates a new outer dictionary.
+    #
+    # The LiDAR objects are intentionally shared because they are
+    # the SAME LiDAR sample for every camera projection.
+    cameraFrameData = frameData.copy()
+
+    # Replace only the values that belong to the selected camera.
+    cameraFrameData[
+        "cameraChannel"
+    ] = sensorChannel
+
+    cameraFrameData[
+        "cameraRecord"
+    ] = cameraRecord
+
+    cameraFrameData[
+        "cameraPath"
+    ] = cameraPath
+
+    cameraFrameData[
+        "cameraImage"
+    ] = cameraImage
+
+    cameraFrameData[
+        "cameraCalibration"
+    ] = cameraCalibration
+
+    cameraFrameData[
+        "cameraCarPose"
+    ] = cameraCarPose
+
+    return cameraFrameData
+
+
+# ==============================================================
+# Compose six camera IPMs into one surround IPM
+# ==============================================================
+
+def composeSurroundCameraIpm(
+    ipmResults,
+    cameraChannels
+):
+    """
+    Merge the six individual camera IPMs into one surround-view IPM.
+
+    Every camera IPM already uses the SAME:
+
+        car-frame origin
+        BEV bounds
+        BEV resolution
+        RANSAC ground plane
+
+    Therefore no additional geometric transform is required here.
+
+    For a BEV cell visible in only one camera:
+        use that camera pixel.
+
+    For a BEV cell visible in multiple cameras:
+        choose the camera whose viewing ray is closest to that
+        camera's optical axis.
+
+    Camera-frame convention used by the existing IPM:
+
+        X = camera right
+        Y = camera down
+        Z = camera forward / optical depth
+
+    For one projected ground point:
+
+        opticalAxisScore =
+            Z / sqrt(X^2 + Y^2 + Z^2)
+
+    This is cos(theta), where theta is the angle between the
+    viewing ray and the camera optical axis.
+
+    Larger score:
+        smaller viewing angle
+        less edge-of-image distortion
+        preferred camera
+    """
+
+    if len(
+        cameraChannels
+    ) == 0:
+        raise ValueError(
+            "cameraChannels must contain at least one camera."
+        )
+
+    # ----------------------------------------------------------
+    # Use the first camera only to establish common BEV shape
+    # ----------------------------------------------------------
+
+    firstCameraChannel = cameraChannels[
+        0
+    ]
+
+    firstIpmResult = ipmResults[
+        firstCameraChannel
+    ]
+
+    bevHeight = firstIpmResult[
+        "bevHeight"
+    ]
+
+    bevWidth = firstIpmResult[
+        "bevWidth"
+    ]
+
+    expectedRgbShape = (
+        bevHeight,
+        bevWidth,
+        3
+    )
+
+    expectedMaskShape = (
+        bevHeight,
+        bevWidth
+    )
+
+    # ----------------------------------------------------------
+    # Allocate the surround output
+    # ----------------------------------------------------------
+
+    surroundCameraIpmRgb = np.zeros(
+        expectedRgbShape,
+        dtype=np.uint8
+    )
+
+    surroundCameraIpmValidMask = np.zeros(
+        expectedMaskShape,
+        dtype=bool
+    )
+
+    # -infinity means no camera owns the cell yet.
+    bestOpticalAxisScore = np.full(
+        expectedMaskShape,
+        -np.inf,
+        dtype=np.float64
+    )
+
+    # -1 means the BEV cell was not supplied by any camera.
+    sourceCameraIndex = np.full(
+        expectedMaskShape,
+        -1,
+        dtype=np.int16
+    )
+
+    # Count how many final BEV cells are selected from each camera.
+    selectedCellCounts = {
+        cameraChannel: 0
+        for cameraChannel in cameraChannels
+    }
+
+    # ----------------------------------------------------------
+    # Evaluate each camera on the same BEV grid
+    # ----------------------------------------------------------
+
+    for cameraIndex, cameraChannelName in enumerate(
+        cameraChannels
+    ):
+
+        cameraIpmResult = ipmResults[
+            cameraChannelName
+        ]
+
+        cameraIpmRgb = cameraIpmResult[
+            "cameraIpmRgb"
+        ]
+
+        cameraValidMask = cameraIpmResult[
+            "cameraIpmValidMask"
+        ]
+
+        cameraPoints = cameraIpmResult[
+            "cameraPoints"
+        ]
+
+        # ------------------------------------------------------
+        # Validate common geometry
+        # ------------------------------------------------------
+
+        if cameraIpmRgb.shape != expectedRgbShape:
+            raise ValueError(
+                f"{cameraChannelName} IPM RGB shape "
+                f"{cameraIpmRgb.shape} does not match "
+                f"{expectedRgbShape}."
+            )
+
+        if cameraValidMask.shape != expectedMaskShape:
+            raise ValueError(
+                f"{cameraChannelName} IPM mask shape "
+                f"{cameraValidMask.shape} does not match "
+                f"{expectedMaskShape}."
+            )
+
+        expectedPointCount = (
+            bevHeight
+            * bevWidth
+        )
+
+        if cameraPoints.shape != (
+            3,
+            expectedPointCount
+        ):
+            raise ValueError(
+                f"{cameraChannelName} cameraPoints shape "
+                f"{cameraPoints.shape} does not match "
+                f"(3, {expectedPointCount})."
+            )
+
+        # ------------------------------------------------------
+        # Optical-axis score
+        # ------------------------------------------------------
+        #
+        # cameraPoints:
+        #
+        #     row 0 -> X
+        #     row 1 -> Y
+        #     row 2 -> Z = optical depth
+
+        cameraX = cameraPoints[
+            0,
+            :
+        ]
+
+        cameraY = cameraPoints[
+            1,
+            :
+        ]
+
+        cameraZ = cameraPoints[
+            2,
+            :
+        ]
+
+        rayLength = np.sqrt(
+            cameraX ** 2
+            + cameraY ** 2
+            + cameraZ ** 2
+        )
+
+        opticalAxisScoreFlat = np.full(
+            rayLength.shape,
+            -np.inf,
+            dtype=np.float64
+        )
+
+        nonZeroRayMask = (
+            rayLength
+            > 0.0
+        )
+
+        opticalAxisScoreFlat[
+            nonZeroRayMask
+        ] = (
+            cameraZ[
+                nonZeroRayMask
+            ]
+            / rayLength[
+                nonZeroRayMask
+            ]
+        )
+
+        opticalAxisScore = opticalAxisScoreFlat.reshape(
+            bevHeight,
+            bevWidth
+        )
+
+        # ------------------------------------------------------
+        # Camera wins a cell when:
+        #
+        # 1. the cell is visible in this camera
+        # 2. its viewing angle is better than the current owner
+        # ------------------------------------------------------
+
+        replaceMask = (
+            cameraValidMask
+            & (
+                opticalAxisScore
+                > bestOpticalAxisScore
+            )
+        )
+
+        surroundCameraIpmRgb[
+            replaceMask
+        ] = cameraIpmRgb[
+            replaceMask
+        ]
+
+        bestOpticalAxisScore[
+            replaceMask
+        ] = opticalAxisScore[
+            replaceMask
+        ]
+
+        sourceCameraIndex[
+            replaceMask
+        ] = cameraIndex
+
+        surroundCameraIpmValidMask |= (
+            cameraValidMask
+        )
+
+    # ----------------------------------------------------------
+    # Final selected-cell statistics
+    # ----------------------------------------------------------
+
+    for cameraIndex, cameraChannelName in enumerate(
+        cameraChannels
+    ):
+
+        selectedCellCounts[
+            cameraChannelName
+        ] = int(
+            np.sum(
+                sourceCameraIndex
+                == cameraIndex
+            )
+        )
+
+    validCellCount = int(
+        np.sum(
+            surroundCameraIpmValidMask
+        )
+    )
+
+    totalCellCount = int(
+        surroundCameraIpmValidMask.size
+    )
+
+    coveragePercent = (
+        100.0
+        * validCellCount
+        / totalCellCount
+    )
+
+    return {
+        "cameraIpmRgb": surroundCameraIpmRgb,
+
+        "cameraIpmValidMask": (
+            surroundCameraIpmValidMask
+        ),
+
+        "sourceCameraIndex": sourceCameraIndex,
+
+        "selectedCellCounts": selectedCellCounts,
+
+        "bestOpticalAxisScore": bestOpticalAxisScore,
+
+        "bevHeight": bevHeight,
+
+        "bevWidth": bevWidth,
+
+        "validCellCount": validCellCount,
+
+        "totalCellCount": totalCellCount,
+
+        "coveragePercent": coveragePercent
+    }
 
 
 # ==============================================================
@@ -1358,17 +1824,61 @@ def main():
                     bevConfig
                 )
 
-                #CAM_FRONT inverse-perspective mapping
+                # ------------------------------------------------
+                # Six-camera inverse-perspective mapping
+                # ------------------------------------------------
+                #
+                # The SAME processCameraIpm() function is reused
+                # six times.
+                #
+                # What stays the same:
+                #
+                #     LiDAR sample
+                #     LiDAR-time car pose
+                #     RANSAC ground plane
+                #     BEV geometry
+                #
+                # What changes for each camera:
+                #
+                #     camera image
+                #     camera calibration
+                #     camera-time car pose
+                #
+                # Therefore every camera is projected into the same
+                # 350 x 250 car-frame BEV without duplicating the
+                # projection mathematics.
 
-                ipmResult = processCameraIpm(
-                    frameData,
-                    bevResult,
-                    bevConfig,
-                    ipmConfig
+                ipmResults = {}
+
+                for ipmCameraChannel in ipmCameraChannels:
+
+                    cameraFrameData = createCameraFrameData(
+                        loader,
+                        sample,
+                        frameData,
+                        ipmCameraChannel
+                    )
+
+                    ipmResults[
+                        ipmCameraChannel
+                    ] = processCameraIpm(
+                        cameraFrameData,
+                        bevResult,
+                        bevConfig,
+                        ipmConfig
+                    )
+
+                # ------------------------------------------------
+                # Compose the six IPMs into one surround IPM
+                # ------------------------------------------------
+
+                ipmResult = composeSurroundCameraIpm(
+                    ipmResults,
+                    ipmCameraChannels
                 )
 
                 # ------------------------------------------------
-                # Camera IPM + LiDAR + semantic fusion
+                # Surround Camera IPM + LiDAR + semantic fusion
                 # ------------------------------------------------
 
                 cameraLidarFusionResult = processCameraLidarFusion(
@@ -1379,8 +1889,40 @@ def main():
                 )
 
                 print()
-                print("Camera IPM:")
-                print("-----------")
+                print("Camera IPMs:")
+                print("------------")
+
+                for ipmCameraChannel in ipmCameraChannels:
+
+                    cameraIpmResult = ipmResults[
+                        ipmCameraChannel
+                    ]
+
+                    print()
+
+                    print(
+                        f"{ipmCameraChannel}:"
+                    )
+
+                    print(
+                        f"  IPM shape       : "
+                        f"{cameraIpmResult['cameraIpmRgb'].shape}"
+                    )
+
+                    print(
+                        f"  Valid BEV cells : "
+                        f"{cameraIpmResult['validCellCount']} / "
+                        f"{cameraIpmResult['totalCellCount']}"
+                    )
+
+                    print(
+                        f"  Camera coverage : "
+                        f"{cameraIpmResult['coveragePercent']:.2f}%"
+                    )
+
+                print()
+                print("Surround Camera IPM:")
+                print("--------------------")
 
                 print(
                     f"IPM shape       : "
@@ -1398,9 +1940,19 @@ def main():
                     f"{ipmResult['coveragePercent']:.2f}%"
                 )
 
+                print()
+                print("Final BEV cells selected from each camera:")
+
+                for ipmCameraChannel in ipmCameraChannels:
+
+                    print(
+                        f"  {ipmCameraChannel:<16}: "
+                        f"{ipmResult['selectedCellCounts'][ipmCameraChannel]}"
+                    )
+
 
                 print()
-                print("Camera + LiDAR fused BEV:")
+                print("Surround Camera + LiDAR fused BEV:")
                 print("-------------------------")
 
                 print(
@@ -1438,12 +1990,89 @@ def main():
                         exist_ok=True
                     )
 
+                    # ------------------------------------------------
+                    # Save raw six-camera surround IPM
+                    # ------------------------------------------------
+
+                    surroundIpmOutputPath = (
+                        outputDirectory
+                        / (
+                            f"{scene['name']}_"
+                            f"sample_{sampleIndex:04d}_"
+                            f"surround_camera_ipm.png"
+                        )
+                    )
+
+                    surroundIpmFigure, surroundIpmAxis = plt.subplots(
+                        1,
+                        1,
+                        figsize=(
+                            7,
+                            10
+                        )
+                    )
+
+                    surroundIpmAxis.imshow(
+                        ipmResult[
+                            "cameraIpmRgb"
+                        ],
+                        origin="upper"
+                    )
+
+                    surroundIpmAxis.scatter(
+                        bevResult[
+                            "carColumn"
+                        ],
+                        bevResult[
+                            "carRow"
+                        ],
+                        marker="^",
+                        s=80,
+                        label="Car"
+                    )
+
+                    surroundIpmAxis.set_title(
+                        "Six-Camera Surround IPM"
+                    )
+
+                    surroundIpmAxis.set_xlabel(
+                        "BEV column (+y left)"
+                    )
+
+                    surroundIpmAxis.set_ylabel(
+                        "BEV row (+x forward)"
+                    )
+
+                    surroundIpmAxis.legend(
+                        loc="lower right"
+                    )
+
+                    surroundIpmFigure.tight_layout()
+
+                    surroundIpmFigure.savefig(
+                        surroundIpmOutputPath,
+                        dpi=150,
+                        bbox_inches="tight"
+                    )
+
+                    print()
+                    print(
+                        f"Surround Camera IPM saved to:\n"
+                        f"{surroundIpmOutputPath}"
+                    )
+
+                    plt.show()
+
+                    plt.close(
+                        surroundIpmFigure
+                    )
+
                     fusedOutputPath = (
                         outputDirectory
                         / (
                             f"{scene['name']}_"
                             f"sample_{sampleIndex:04d}_"
-                            f"camera_lidar_fused_bev.png"
+                            f"surround_camera_lidar_fused_bev.png"
                         )
                     )
 
@@ -1531,7 +2160,7 @@ def main():
                     # ------------------------------------------------
 
                     fusedAxis.set_title(
-                        "Fused Camera-IPM + LiDAR + Vehicle Semantics"
+                        "Fused Surround Camera-IPM + LiDAR + Vehicle Semantics"
                     )
 
                     fusedAxis.set_xlabel(
