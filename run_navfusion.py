@@ -924,6 +924,15 @@ def composeSurroundCameraIpm(
             surroundCameraIpmValidMask
         ),
 
+        # Preserve the camera order used by sourceCameraIndex.
+        #
+        # sourceCameraIndex == 0 corresponds to cameraChannels[0],
+        # sourceCameraIndex == 1 corresponds to cameraChannels[1],
+        # and so on.
+        "cameraChannels": tuple(
+            cameraChannels
+        ),
+
         "sourceCameraIndex": sourceCameraIndex,
 
         "selectedCellCounts": selectedCellCounts,
@@ -2219,19 +2228,21 @@ def main():
                 )
 
                 # ------------------------------------------------
-                # Create complete 3 x 3 visualization
+                # Create complete 4 x 3 surround visualization
                 # ------------------------------------------------
 
                 figure = createSensorFusionFigure(
                     sensorResult,
                     bevResult,
                     semanticResult,
+                    ipmResult,
+                    cameraLidarFusionResult,
                     visualizationRangeM
                 )
 
                 figure.suptitle(
                     (
-                        f"NavFusion Semantic BEV | "
+                        f"NavFusion Surround Sensor Fusion | "
                         f"{scene['name']} | "
                         f"Sample {sampleIndex:04d}"
                     ),
